@@ -1,11 +1,12 @@
 """AstrBot entry point for the QQ 空间 bridge."""
 
+# ruff: noqa: E402
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 import inspect
-import importlib
 import json
 import random
 import re
@@ -209,23 +210,6 @@ def _public_error_reason(message: Any) -> str:
     return truncate(text, 80)
 
 
-def _prepare_local_qzone_bridge_imports() -> None:
-    """Force bundled qzone_bridge modules to reload from this plugin directory."""
-
-    def _same_path(value: str) -> bool:
-        try:
-            return Path(value).resolve() == PLUGIN_ROOT
-        except Exception:
-            return False
-
-    sys.path[:] = [path for path in sys.path if not _same_path(path)]
-    sys.path.insert(0, str(PLUGIN_ROOT))
-    importlib.invalidate_caches()
-    for name in list(sys.modules):
-        if name == "qzone_bridge" or name.startswith("qzone_bridge."):
-            sys.modules.pop(name, None)
-
-
 def _chmod_private(path: Path) -> None:
     try:
         os.chmod(path, 0o600)
@@ -420,7 +404,55 @@ def _standard_data_dir(plugin_root: Path) -> Path:
     return data_dir
 
 
-_prepare_local_qzone_bridge_imports()
+def _local_qzone_bridge_root() -> Path:
+    package_root = (PLUGIN_ROOT / "qzone_bridge").resolve(strict=False)
+    package_init = package_root / "__init__.py"
+    if not package_init.is_file():
+        raise RuntimeError(f"qzone_bridge package is missing: {package_init}")
+    return package_root
+
+
+def _verify_local_qzone_bridge_module(name: str, package_root: Path) -> None:
+    module = sys.modules.get(name)
+    if module is None:
+        return
+    module_file = getattr(module, "__file__", None)
+    if not module_file:
+        raise RuntimeError(f"{name} is already loaded without a file path")
+    package_path = Path(module_file).resolve(strict=False)
+    if not _path_contains(package_root, package_path):
+        raise RuntimeError(f"{name} resolved outside plugin directory: {package_path}")
+
+
+def _load_local_qzone_bridge_package() -> None:
+    package_root = _local_qzone_bridge_root()
+    for name in tuple(sys.modules):
+        if name == "qzone_bridge" or name.startswith("qzone_bridge."):
+            _verify_local_qzone_bridge_module(name, package_root)
+
+    if "qzone_bridge" in sys.modules:
+        return
+
+    package_init = package_root / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        "qzone_bridge",
+        package_init,
+        submodule_search_locations=[str(package_root)],
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"unable to load qzone_bridge package from {package_init}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["qzone_bridge"] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        if sys.modules.get("qzone_bridge") is module:
+            sys.modules.pop("qzone_bridge", None)
+        raise
+    _verify_local_qzone_bridge_module("qzone_bridge", package_root)
+
+
+_load_local_qzone_bridge_package()
 
 from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.drafts import DraftPost, DraftStore
@@ -1526,8 +1558,8 @@ class QzoneStablePlugin(Star):
             command_prefixes=prefixes,
         )
 
-    def _create_draft(self, event: AstrMessageEvent, post: PostPayload, *, anonymous: bool = False) -> DraftPost:
-        return self.drafts.add(
+    async def _create_draft(self, event: AstrMessageEvent, post: PostPayload, *, anonymous: bool = False) -> DraftPost:
+        return await self.drafts.add_async(
             author_uin=self._sender_id(event),
             author_name=self._sender_name(event),
             group_id=self._group_id(event),
@@ -1815,7 +1847,7 @@ class QzoneStablePlugin(Star):
                 commented_keys.add(key)
                 self._save_auto_comment_keys(commented_keys)
                 continue
-            self._post_store().upsert(post)
+            await self._post_store().upsert_async(post)
             text = await self._generate_comment_text(None, post)  # type: ignore[arg-type]
             if not text.strip():
                 continue
@@ -1972,10 +2004,10 @@ class QzoneStablePlugin(Star):
     def qzone(self):
         pass
 
-    @filter.on_platform_loaded()
-    async def qzone_on_platform_loaded(self):
+    @filter.on_astrbot_loaded()
+    async def qzone_on_astrbot_loaded(self):
         self._start_scheduled_tasks()
-        await self._bootstrap_auto_bind("platform load")
+        await self._bootstrap_auto_bind("astrbot load")
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def qzone_capture_aiocqhttp_client(self, event: AstrMessageEvent):
@@ -2096,7 +2128,7 @@ class QzoneStablePlugin(Star):
                 content_sanitized=True,
             )
             if payload.get("fid"):
-                self._post_store().upsert(
+                await self._post_store().upsert_async(
                     QzonePost(
                         hostuin=self._self_id(event),
                         fid=str(payload.get("fid") or ""),
@@ -2126,7 +2158,7 @@ class QzoneStablePlugin(Star):
         if not post.content.strip() and not post.media:
             yield self._command_result(event, "说说生成失败。")
             return
-        draft = self._create_draft(event, post, anonymous=False)
+        draft = await self._create_draft(event, post, anonymous=False)
         await self._notify_review_target(event, draft, "有一条 AI 写稿等待审核")
         yield await self._markdown_result(event, f"已生成稿件 #{draft.id}，可用 过稿 {draft.id} 发布。", subdir="drafts")
 
@@ -2170,8 +2202,8 @@ class QzoneStablePlugin(Star):
             if comment_position <= 0:
                 yield self._command_result(event, "评论序号需要从 1 开始。")
                 return
-        saved = self._post_store().get(post_id)
-        draft = None if saved else self.drafts.get(post_id)
+        saved = await self._post_store().get_async(post_id)
+        draft = None if saved else await self.drafts.get_async(post_id)
         if saved is None and (draft is None or not draft.published_fid):
             yield self._command_result(event, f"稿件 #{post_id} 不存在或还没有发布。")
             return
@@ -2201,7 +2233,7 @@ class QzoneStablePlugin(Star):
                     for item in detail.get("comments") or []
                     if isinstance(item, dict)
                 ]
-            self._post_store().upsert(post)
+            await self._post_store().upsert_async(post)
             login_uin = int(status.get("login_uin") or 0)
             comments = [item for item in post.comments if not login_uin or item.uin != login_uin]
             if not comments:
@@ -2233,7 +2265,7 @@ class QzoneStablePlugin(Star):
         if not post.content.strip() and not post.media:
             yield self._command_result(event, "投稿内容或图片不能为空。")
             return
-        draft = self._create_draft(event, post, anonymous=False)
+        draft = await self._create_draft(event, post, anonymous=False)
         await self._notify_review_target(event, draft, "收到一条投稿")
         yield await self._markdown_result(event, f"投稿已收到，稿件编号 #{draft.id}。", subdir="drafts")
 
@@ -2243,7 +2275,7 @@ class QzoneStablePlugin(Star):
         if not post.content.strip() and not post.media:
             yield self._command_result(event, "投稿内容或图片不能为空。")
             return
-        draft = self._create_draft(event, post, anonymous=True)
+        draft = await self._create_draft(event, post, anonymous=True)
         await self._notify_review_target(event, draft, "收到一条匿名投稿")
         yield await self._markdown_result(event, f"匿名投稿已收到，稿件编号 #{draft.id}。", subdir="drafts")
 
@@ -2253,11 +2285,13 @@ class QzoneStablePlugin(Star):
         if draft_id <= 0:
             yield self._command_result(event, "请提供要撤回的稿件ID，例如：撤稿 3。")
             return
-        draft = self.drafts.get(draft_id)
+        sender_id = self._sender_id(event)
+        is_admin = self._is_admin(event)
+        draft = await self.drafts.get_async(draft_id)
         if draft is None:
             yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
             return
-        if draft.author_uin != self._sender_id(event) and not self._is_admin(event):
+        if draft.author_uin != sender_id and not is_admin:
             yield self._command_result(event, "只能撤回自己的投稿。")
             return
         if draft.status != "pending":
@@ -2267,7 +2301,7 @@ class QzoneStablePlugin(Star):
 
         def recall(current: DraftPost) -> None:
             nonlocal failure
-            if current.author_uin != self._sender_id(event) and not self._is_admin(event):
+            if current.author_uin != sender_id and not is_admin:
                 failure = "permission"
                 return
             if current.status != "pending":
@@ -2275,7 +2309,7 @@ class QzoneStablePlugin(Star):
                 return
             current.status = "recalled"
 
-        updated = self.drafts.update(draft.id, recall)
+        updated = await self.drafts.update_async(draft.id, recall)
         if updated is None:
             yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
             return
@@ -2292,10 +2326,10 @@ class QzoneStablePlugin(Star):
     async def view_post(self, event: AstrMessageEvent):
         draft_id, _ = self._draft_id_from_event(event, ("看稿", "查看稿件"))
         if draft_id > 0:
-            draft = self.drafts.get(draft_id)
+            draft = await self.drafts.get_async(draft_id)
             text = draft.preview(include_private=True) if draft else f"稿件 #{draft_id} 不存在。"
         else:
-            drafts = self.drafts.list(status="pending")[-10:]
+            drafts = (await self.drafts.list_async(status="pending"))[-10:]
             text = "\n\n".join(draft.preview(include_private=True) for draft in drafts) or "暂无待审核稿件。"
         yield await self._markdown_result(event, text, subdir="drafts")
 
@@ -2306,7 +2340,7 @@ class QzoneStablePlugin(Star):
         if draft_id <= 0:
             yield self._command_result(event, "请提供要通过的稿件ID，例如：过稿 3。")
             return
-        draft = self.drafts.get(draft_id)
+        draft = await self.drafts.get_async(draft_id)
         if draft is None:
             yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
             return
@@ -2322,7 +2356,7 @@ class QzoneStablePlugin(Star):
                 return
             current.status = "approved"
 
-        claimed = self.drafts.update(draft.id, claim_approved)
+        claimed = await self.drafts.update_async(draft.id, claim_approved)
         if claimed is None:
             yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
             return
@@ -2346,7 +2380,7 @@ class QzoneStablePlugin(Star):
                 current.status = "published"
                 current.published_fid = published_fid
 
-            updated_draft = self.drafts.update(draft.id, mark_published) or draft
+            updated_draft = await self.drafts.update_async(draft.id, mark_published) or draft
             if published_fid:
                 login_uin = 0
                 try:
@@ -2361,7 +2395,7 @@ class QzoneStablePlugin(Star):
                     nickname="",
                     images=[str(item.source) for item in post.media],
                 )
-                self._post_store().upsert(saved_post)
+                await self._post_store().upsert_async(saved_post)
             await self._notify_draft_author(event, updated_draft, f"你的投稿 #{updated_draft.id} 已通过并发布。")
         except QzoneBridgeError as exc:
             if profile_task is not None:
@@ -2371,7 +2405,7 @@ class QzoneStablePlugin(Star):
                 if current.status == "approved":
                     current.status = "pending"
 
-            self.drafts.update(draft.id, rollback_approved)
+            await self.drafts.update_async(draft.id, rollback_approved)
             yield self._command_result(event, self._error_text(exc))
             return
         yield await self._publish_result(event, post, payload, profile_task=profile_task)
@@ -2383,7 +2417,7 @@ class QzoneStablePlugin(Star):
         if draft_id <= 0:
             yield self._command_result(event, "请提供要拒绝的稿件ID，例如：拒稿 3 原因。")
             return
-        draft = self.drafts.get(draft_id)
+        draft = await self.drafts.get_async(draft_id)
         if draft is None:
             yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
             return
@@ -2400,7 +2434,7 @@ class QzoneStablePlugin(Star):
             current.status = "rejected"
             current.reject_reason = reason or "未填写原因"
 
-        updated = self.drafts.update(draft.id, reject)
+        updated = await self.drafts.update_async(draft.id, reject)
         if updated is None:
             yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
             return

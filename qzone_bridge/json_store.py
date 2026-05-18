@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
@@ -56,6 +57,15 @@ class AtomicItemStoreFile:
             result = updater(payload)
             self._write_unlocked(payload)
             return result
+
+    async def read_async(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self.read)
+
+    async def write_async(self, payload: dict[str, Any]) -> None:
+        await asyncio.to_thread(self.write, payload)
+
+    async def transact_async(self, updater: Callable[[dict[str, Any]], T]) -> T:
+        return await asyncio.to_thread(self.transact, updater)
 
     def _read_unlocked(self) -> dict[str, Any]:
         if not self.path.exists():
