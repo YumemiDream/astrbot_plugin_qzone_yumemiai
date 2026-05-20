@@ -25,7 +25,7 @@ from astrbot.api.star import Context, Star
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026052001
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026052002
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -487,7 +487,7 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
                     return False
 
     contract_attributes = {
-        "qzone_bridge.publish_renderer": ("combine_rendered_post_cards",),
+        "qzone_bridge.publish_renderer": ("combine_rendered_post_cards", "SUPPORTS_COMMENT_RESULT_SECTIONS"),
         "qzone_bridge.social": ("extract_nickname",),
     }
     for module_name, attributes in contract_attributes.items():
@@ -496,7 +496,10 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
             continue
         _verify_local_qzone_bridge_module(module_name, package_root)
         for attribute in attributes:
-            if getattr(module, attribute, None) is None:
+            value = getattr(module, attribute, None)
+            if value is None:
+                return False
+            if attribute == "SUPPORTS_COMMENT_RESULT_SECTIONS" and value is not True:
                 return False
 
     contract_class_attributes = {
@@ -3218,6 +3221,7 @@ class QzoneStablePlugin(Star):
                 [post],
                 post.detail_text(1),
                 fallback_when_unrendered=False,
+                comment_texts={id(post): content},
             ):
                 yield result
 
