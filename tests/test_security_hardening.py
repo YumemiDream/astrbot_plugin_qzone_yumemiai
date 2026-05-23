@@ -1211,6 +1211,30 @@ def test_publish_renderer_fixed_width_keeps_range_cards_aligned(tmp_path: Path) 
         assert short_image.width == 720 * 3
 
 
+def test_publish_renderer_short_single_image_card_uses_compact_adaptive_width(tmp_path: Path) -> None:
+    from PIL import Image
+
+    from qzone_bridge.media import PostMedia, PostPayload
+    from qzone_bridge.publish_renderer import RenderProfile, render_publish_result_image
+
+    source = tmp_path / "single.png"
+    Image.new("RGB", (640, 960), (238, 238, 238)).save(source)
+
+    rendered = render_publish_result_image(
+        PostPayload(
+            content="short text",
+            media=[PostMedia(kind="image", source=str(source), trusted_local=True)],
+        ),
+        tmp_path,
+        profile=RenderProfile(nickname="user", time_text="06:32"),
+        width=900,
+        remote_timeout=0.01,
+    )
+
+    with Image.open(rendered) as image:
+        assert image.width == 560 * 3
+
+
 def test_publish_renderer_draws_comment_section_separated_from_original(tmp_path: Path) -> None:
     from PIL import Image
 
