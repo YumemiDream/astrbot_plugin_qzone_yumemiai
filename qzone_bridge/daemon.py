@@ -368,25 +368,34 @@ class QzoneDaemonService:
         self._ensure_session_ready()
         if limit <= 0:
             limit = 5
-        hostuin = int(hostuin or self.state.session.uin or 0)
+        session_uin = int(self.state.session.uin or 0)
+        scope = str(scope or "").strip().lower()
+        hostuin = int(hostuin or session_uin or 0)
         if not hostuin:
             raise QzoneNeedsRebind()
-        scope = scope or ("self" if hostuin == self.state.session.uin else "profile")
+        if scope == "active":
+            if not session_uin:
+                raise QzoneNeedsRebind()
+            hostuin = session_uin
+        scope = scope or ("self" if hostuin == session_uin else "profile")
         items: list[FeedEntry] = []
         next_cursor = cursor or ""
         has_more = False
         page_round = 0
         while len(items) < limit and page_round < 6:
-            if scope == "self":
+            if scope in {"self", "active"}:
                 if page_round == 0 and not next_cursor:
                     try:
                         payload = unwrap_payload(await self.client.index())
                     except (QzoneRequestError, QzoneParseError) as exc:
                         if not self._should_fallback_feed_fetch(exc):
                             raise
-                        log.warning("qzone self feed primary fetch failed, using legacy fallback: %s", exc)
+                        log.warning("qzone %s feed primary fetch failed, using legacy fallback: %s", scope, exc)
                         try:
-                            payload = await self.client.legacy_feeds(hostuin, page=1, num=max(limit, 20))
+                            if scope == "active":
+                                payload = await self.client.legacy_recent_feeds()
+                            else:
+                                payload = await self.client.legacy_feeds(hostuin, page=1, num=max(limit, 20))
                         except (QzoneRequestError, QzoneParseError) as legacy_exc:
                             log.warning("qzone msglist feed fallback failed, using recent feed fallback: %s", legacy_exc)
                             payload = await self.client.legacy_recent_feeds()
@@ -406,10 +415,11 @@ class QzoneDaemonService:
                     payload = unwrap_payload(await self.client.get_feeds(hostuin, next_cursor))
                 feedpage = payload
 
-            feedpage, page_items = extract_feed_page(feedpage, default_hostuin=hostuin)
+            default_hostuin = 0 if scope == "active" else hostuin
+            feedpage, page_items = extract_feed_page(feedpage, default_hostuin=default_hostuin)
             if not isinstance(feedpage, dict):
                 break
-            self.client.cache_feed_page(hostuin, page_items)
+            self.client.cache_feed_page(default_hostuin, page_items)
             items.extend(page_items)
             has_more = feed_page_has_more(feedpage)
             next_cursor = feed_page_cursor(feedpage)

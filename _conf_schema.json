@@ -134,6 +134,17 @@
         },
         "hint": "围绕基准时间随机前后浮动；0 表示严格按基准时间。"
       },
+      "comment_latest_count": {
+        "description": "每次自动评论的最新说说条数",
+        "type": "int",
+        "default": 1,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        },
+        "hint": "每次定时自动评论会从好友最新动态中选择未评论过的说说，跳过自己的动态和已评论过的动态。"
+      },
       "read_prob": {
         "description": "消息触发读说说概率",
         "type": "float",
@@ -141,10 +152,10 @@
         "hint": "收到 OneBot 消息时，按概率查看发送者空间并自动评论；0 表示关闭。"
       },
       "send_admin": {
-        "description": "自动评论后反馈管理员",
+        "description": "自动任务后反馈管理员",
         "type": "bool",
         "default": false,
-        "hint": "开启后，定时/概率自动评论会向管理群或管理员私聊发送评论结果和目标说说渲染图。"
+        "hint": "开启后，定时发布、定时评论和概率自动评论会向管理群或管理员私聊发送结果和 QQ 空间风格渲染图。"
       },
       "like_when_comment": {
         "description": "评论时同时点赞",

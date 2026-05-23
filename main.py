@@ -25,7 +25,7 @@ from astrbot.api.star import Context, Star
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026052304
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026052305
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -1313,30 +1313,79 @@ class QzoneStablePlugin(Star):
         event: AstrMessageEvent | None,
         post: QzonePost,
         message: str,
+        *,
+        comment_text: str = "",
     ) -> None:
         if not self.settings.send_admin:
             return
         bot = self._capture_onebot_client(event)
         if bot is None:
             return
-        image_path = await self._render_qzone_post_card(post)
+        try:
+            image_path = await self._render_qzone_post_card(post, comment_text=comment_text)
+        except TypeError as exc:
+            if "comment_text" not in str(exc):
+                raise
+            image_path = await self._render_qzone_post_card(post)
         outgoing: Any = message
         if image_path is not None:
             outgoing = [
                 {"type": "text", "data": {"text": f"{message}\n"}},
                 {"type": "image", "data": {"file": self._onebot_file_uri(image_path)}},
             ]
+        await self._send_admin_outgoing(bot, outgoing)
+
+    async def _notify_admin_publish_result(
+        self,
+        post: PostPayload,
+        payload: dict[str, Any],
+        message: str,
+    ) -> None:
+        if not getattr(self.settings, "send_admin", False):
+            return
+        bot = self._capture_onebot_client(None)
+        if bot is None:
+            logger.info("qzone scheduled publish admin notification skipped: no OneBot client")
+            return
+        result_text = format_action_result("发布结果", payload)
+        outgoing: Any = f"{message}\n{result_text}"
+        if getattr(self.settings, "render_publish_result", True):
+            try:
+                profile = await self._publisher_render_profile(None, allow_network=False)
+            except Exception:
+                profile = RenderProfile(time_text=time.strftime("%H:%M"))
+            try:
+                image_path = await asyncio.to_thread(
+                    _render_publish_result_image,
+                    post,
+                    self.data_dir / "rendered_posts",
+                    profile=profile,
+                    result=payload,
+                    width=int(getattr(self.settings, "render_result_width", 900) or 900),
+                    remote_timeout=float(getattr(self.settings, "render_remote_timeout", 0.35) or 0.35),
+                )
+            except Exception as exc:
+                logger.exception("qzone scheduled publish result render failed: %s", exc)
+            else:
+                outgoing = [
+                    {"type": "text", "data": {"text": f"{message}\n"}},
+                    {"type": "image", "data": {"file": self._onebot_file_uri(image_path)}},
+                ]
+        await self._send_admin_outgoing(bot, outgoing)
+
+    async def _send_admin_outgoing(self, bot: Any, outgoing: Any) -> None:
         try:
-            if self.settings.manage_group and hasattr(bot, "send_group_msg"):
-                result = bot.send_group_msg(group_id=self.settings.manage_group, message=outgoing)
+            manage_group = int(getattr(self.settings, "manage_group", 0) or 0)
+            if manage_group and hasattr(bot, "send_group_msg"):
+                result = bot.send_group_msg(group_id=manage_group, message=outgoing)
                 await self._maybe_await(result)
                 return
             if hasattr(bot, "send_private_msg"):
-                for admin in self.settings.admin_uins:
+                for admin in getattr(self.settings, "admin_uins", []):
                     result = bot.send_private_msg(user_id=admin, message=outgoing)
                     await self._maybe_await(result)
         except Exception as exc:
-            logger.debug("qzone auto post-card notification failed: %s", exc)
+            logger.debug("qzone admin notification failed: %s", exc)
 
     def _stop_event(self, event: AstrMessageEvent) -> None:
         stopper = getattr(event, "stop_event", None)
@@ -2284,28 +2333,50 @@ class QzoneStablePlugin(Star):
         while True:
             delay = self._cron_delay_seconds(cron, offset)
             if delay <= 0:
+                logger.info("qzone scheduled %s disabled: invalid cron=%s", name, cron)
                 return
+            logger.info("qzone scheduled %s next run in %.1fs cron=%s offset=%s", name, delay, cron, offset)
             await asyncio.sleep(delay)
             try:
+                logger.info("qzone scheduled %s run started", name)
                 await action()
+                logger.info("qzone scheduled %s run finished", name)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning("qzone scheduled %s failed: %s", name, exc)
 
     async def _auto_publish_once(self) -> None:
+        logger.info("qzone scheduled publish started")
         fake_event = None
         text = await self._generate_post_text(fake_event, "")  # type: ignore[arg-type]
         if not text.strip():
+            logger.info("qzone scheduled publish skipped: generated content is empty")
             return
+        post = PostPayload(content=text.strip(), media=[])
         await self._ensure_cookie_ready()
         await self._ensure_daemon()
-        await self.controller.publish_post(content=text.strip(), content_sanitized=True)
+        payload = await self.controller.publish_post(content=post.content, content_sanitized=True)
+        logger.info(
+            "qzone scheduled publish succeeded fid=%s text_length=%s",
+            payload.get("fid") or "",
+            len(post.content),
+        )
+        await self._notify_admin_publish_result(post, payload, "定时自动发布完成")
+
+    def _scheduled_comment_target_count(self) -> int:
+        configured = int(getattr(self.settings, "comment_latest_count", 1) or 1)
+        max_limit = int(getattr(self.settings, "max_feed_limit", 20) or 20)
+        return max(1, min(configured, max(1, max_limit)))
 
     async def _auto_comment_once(self) -> None:
+        target_count = self._scheduled_comment_target_count()
+        max_limit = max(1, int(getattr(self.settings, "max_feed_limit", 20) or 20))
+        fetch_limit = min(max_limit, max(5, target_count * 3))
+        logger.info("qzone scheduled comment started target_count=%s fetch_limit=%s", target_count, fetch_limit)
         await self._ensure_cookie_ready()
         await self._ensure_daemon()
-        payload = await self.controller.list_feeds(hostuin=0, limit=5)
+        payload = await self.controller.list_feeds(hostuin=0, limit=fetch_limit, scope="active")
         entries = self._to_feed_entries(payload)
         commented_keys = self._load_auto_comment_keys()
         login_uin = 0
@@ -2314,11 +2385,23 @@ class QzoneStablePlugin(Star):
             login_uin = int(status.get("login_uin") or 0)
         except Exception:
             pass
+        commented = 0
+        skipped_self = 0
+        skipped_duplicate = 0
+        skipped_empty = 0
+        skipped_detail = 0
         for entry in entries:
+            if commented >= target_count:
+                break
+            if not entry.fid or not entry.hostuin:
+                skipped_empty += 1
+                continue
             if login_uin and entry.hostuin == login_uin:
+                skipped_self += 1
                 continue
             key = self._auto_comment_key(entry)
             if key in commented_keys:
+                skipped_duplicate += 1
                 continue
             detail_payload: dict[str, Any] | None = None
             try:
@@ -2329,7 +2412,14 @@ class QzoneStablePlugin(Star):
                     if detail_entry.fid == entry.fid and detail_entry.hostuin == entry.hostuin:
                         entry = detail_entry
             except Exception as exc:
-                logger.debug("qzone scheduled comment detail check failed: %s", exc)
+                skipped_detail += 1
+                logger.warning(
+                    "qzone scheduled comment skipped hostuin=%s fid=%s: detail check failed: %s",
+                    entry.hostuin,
+                    entry.fid,
+                    exc,
+                )
+                continue
             post = post_from_entry(entry, detail=(detail_payload or {}).get("raw"), local_id=0)
             if detail_payload and detail_payload.get("comments"):
                 post.comments = [
@@ -2345,18 +2435,68 @@ class QzoneStablePlugin(Star):
             if login_uin and any(comment.uin == login_uin for comment in post.comments):
                 commented_keys.add(key)
                 self._save_auto_comment_keys(commented_keys)
+                skipped_duplicate += 1
                 continue
             await self._post_store().upsert_async(post)
             text = await self._generate_comment_text(None, post)  # type: ignore[arg-type]
             if not text.strip():
+                skipped_empty += 1
                 continue
-            await self._post_service().comment_post(post, text.strip())
-            if self.settings.like_when_comment:
-                await self._post_service().like_post(post)
-            await self._notify_admin_post_card(None, post, f"定时自动评论了 {self._post_display_nickname(post)} 的说说：{truncate(text, 60)}")
+            comment_text = text.strip()
+            await self._post_service().comment_post(post, comment_text)
             commented_keys.add(key)
             self._save_auto_comment_keys(commented_keys)
-            break
+            commented += 1
+            if getattr(self.settings, "like_when_comment", False):
+                try:
+                    await self._post_service().like_post(post)
+                except Exception as exc:
+                    logger.warning(
+                        "qzone scheduled comment like failed after comment hostuin=%s fid=%s: %s",
+                        post.hostuin,
+                        post.fid,
+                        exc,
+                    )
+            try:
+                await self._notify_admin_post_card(
+                    None,
+                    post,
+                    f"定时自动评论了 {self._post_display_nickname(post)} 的说说：{truncate(comment_text, 60)}",
+                    comment_text=comment_text,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "qzone scheduled comment admin notification failed hostuin=%s fid=%s: %s",
+                    post.hostuin,
+                    post.fid,
+                    exc,
+                )
+            logger.info(
+                "qzone scheduled comment posted hostuin=%s fid=%s count=%s/%s",
+                post.hostuin,
+                post.fid,
+                commented,
+                target_count,
+            )
+        if commented:
+            logger.info(
+                "qzone scheduled comment succeeded commented=%s skipped_self=%s skipped_duplicate=%s skipped_empty=%s skipped_detail=%s scanned=%s",
+                commented,
+                skipped_self,
+                skipped_duplicate,
+                skipped_empty,
+                skipped_detail,
+                len(entries),
+            )
+        else:
+            logger.info(
+                "qzone scheduled comment finished with no eligible posts skipped_self=%s skipped_duplicate=%s skipped_empty=%s skipped_detail=%s scanned=%s",
+                skipped_self,
+                skipped_duplicate,
+                skipped_empty,
+                skipped_detail,
+                len(entries),
+            )
 
     def _get_cookie_lock(self) -> asyncio.Lock:
         if self._cookie_lock is None:

@@ -112,6 +112,7 @@ class PluginSettings:
     publish_offset: int = 0
     comment_cron: str = ""
     comment_offset: int = 0
+    comment_latest_count: int = 1
     read_prob: float = 0.0
     send_admin: bool = False
     like_when_comment: bool = False
@@ -178,6 +179,7 @@ class PluginSettings:
                 )
                 or 0
             ),
+            comment_latest_count=int(_nested(mapping, "trigger", "comment_latest_count", 1) or 1),
             read_prob=float(_nested(mapping, "trigger", "read_prob", 0.0) or 0.0),
             send_admin=_as_bool(_nested(mapping, "trigger", "send_admin", False), False),
             like_when_comment=_as_bool(_nested(mapping, "trigger", "like_when_comment", False), False),
