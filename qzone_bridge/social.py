@@ -99,6 +99,7 @@ IMAGE_URL_KEYS = (
     "url2",
     "url1",
     "pre",
+    "sloc",
     "smallurl",
     "smallUrl",
     "thumb",
@@ -125,6 +126,7 @@ IMAGE_ALIAS_PRIORITY_KEYS = (
     "url",
     "url1",
     "pre",
+    "sloc",
     "smallurl",
     "smallUrl",
     "thumb",
@@ -181,9 +183,9 @@ IMAGE_HTML_KEYS = (
     "message",
     "text",
 )
-FEED_ID_KEYS = ("fid", "tid", "cellid", "feedid", "feedId", "ugckey", "ugcrightkey")
+FEED_ID_KEYS = ("fid", "tid", "cellid", "feedid", "feedId", "ugcrightkey", "ugckey")
 FEED_FALLBACK_ID_KEYS = ("key",)
-FEED_ID_CONTAINER_KEYS = ("common", "cell_comm", "cellComm", "id")
+FEED_ID_CONTAINER_KEYS = ("common", "comm", "cell_comm", "cellComm", "id", "cell_id", "cellId")
 FEED_NODE_HINT_KEYS = (
     "summary",
     "content",
@@ -383,6 +385,12 @@ def extract_nickname(raw: dict[str, Any] | None, *, hostuin: int = 0) -> str:
 
 
 @dataclass(slots=True)
+class _ImageCandidate:
+    url: str
+    key: str
+
+
+@dataclass(slots=True)
 class QzoneComment:
     commentid: str
     uin: int = 0
@@ -515,8 +523,9 @@ def extract_comments(payload: dict[str, Any]) -> list[QzoneComment]:
     return comments
 
 
-def extract_images(payload: dict[str, Any], *, fid: str = "", hostuin: int = 0) -> list[str]:
-    images: list[str] = []
+def _extract_image_candidates(payload: dict[str, Any], *, fid: str = "", hostuin: int = 0) -> list[_ImageCandidate]:
+    candidates: list[_ImageCandidate] = []
+    seen_image_keys: set[str] = set()
     seen_nodes: set[int] = set()
     target_fid = str(fid or "").strip()
     target_hostuin = _to_int(hostuin)
@@ -535,29 +544,140 @@ def extract_images(payload: dict[str, Any], *, fid: str = "", hostuin: int = 0) 
             return ""
         return source
 
-    def add(value: Any) -> None:
+    def image_url_key(source: str) -> str:
+        parsed = urlparse(source)
+        host = parsed.netloc.lower()
+        path = parsed.path.strip("/")
+        if "qzone.qq.com" in host and "/photo/" in parsed.path:
+            parts = [part for part in parsed.path.split("/") if part]
+            try:
+                index = parts.index("photo")
+            except ValueError:
+                index = -1
+            if index >= 0 and len(parts) > index + 2:
+                return f"qzone-photo:{parts[index + 1]}:{parts[index + 2].split('_', 1)[0]}"
+        if path.startswith("psc"):
+            bits = [part for part in path.split("/") if part]
+            if len(bits) >= 3:
+                return f"qzone-psc:{bits[1]}:{bits[2].rstrip('!')}"
+        return f"url:{parsed.scheme.lower()}://{host}{parsed.path}?{parsed.query}"
+
+    def add(value: Any, *, identity: str = "") -> None:
         if isinstance(value, str):
             value = valid_image_source(value)
-            if value and value not in images:
-                images.append(value)
+            if not value:
+                return
+            key = identity or image_url_key(value)
+            if key in seen_image_keys:
+                return
+            seen_image_keys.add(key)
+            candidates.append(_ImageCandidate(url=value, key=key))
+
+    def _photo_id_from_pic_id(value: Any) -> tuple[str, str]:
+        text = str(value or "").strip()
+        if not text:
+            return "", ""
+        parts = [part for part in text.split(",") if part]
+        if len(parts) >= 2:
+            return parts[0], parts[1]
+        return "", text
+
+    def photo_identity(value: dict[str, Any]) -> str:
+        albumid = str(value.get("albumid") or value.get("albumId") or "").strip()
+        lloc = str(value.get("lloc") or value.get("realLloc") or value.get("picid") or value.get("picId") or "").strip()
+        if not lloc:
+            parsed_album, parsed_lloc = _photo_id_from_pic_id(value.get("pic_id") or value.get("picId"))
+            albumid = albumid or parsed_album
+            lloc = parsed_lloc
+        if lloc:
+            return f"qzone-photo-id:{albumid}:{lloc}"
+        quankey = str(value.get("quankey") or value.get("photoKey") or value.get("photokey") or "").strip()
+        if quankey:
+            return f"qzone-photo-key:{albumid}:{quankey}"
+        return ""
+
+    def best_photourl_source(value: Any) -> str:
+        if not isinstance(value, dict):
+            return ""
+        for key in ("1", "0", "14", "11", "2", "3"):
+            item = value.get(key)
+            if isinstance(item, dict):
+                source = valid_image_source(item.get("url"))
+                if source:
+                    return source
+            else:
+                source = valid_image_source(item)
+                if source:
+                    return source
+        ranked: list[tuple[int, int, str]] = []
+        for item in value.values():
+            if not isinstance(item, dict):
+                continue
+            source = valid_image_source(item.get("url"))
+            if not source:
+                continue
+            width = _to_int(item.get("width"))
+            height = _to_int(item.get("height"))
+            ranked.append((width * height, max(width, height), source))
+        if ranked:
+            ranked.sort(reverse=True)
+            return ranked[0][2]
+        return ""
 
     def best_mapping_image_source(value: dict[str, Any]) -> str:
+        source = best_photourl_source(value.get("photourl"))
+        if source:
+            return source
         for key in IMAGE_ALIAS_PRIORITY_KEYS:
             source = valid_image_source(value.get(key))
             if source:
                 return source
         return ""
 
+    def looks_like_qzone_photo(value: dict[str, Any]) -> bool:
+        return any(
+            key in value
+            for key in (
+                "photourl",
+                "lloc",
+                "realLloc",
+                "pic_id",
+                "picid",
+                "picId",
+                "albumid",
+                "albumId",
+                "origin_width",
+                "origin_height",
+            )
+        )
+
+    def add_mapping_image(value: dict[str, Any]) -> bool:
+        source = best_mapping_image_source(value)
+        if not source:
+            return False
+        identity = photo_identity(value) if looks_like_qzone_photo(value) else ""
+        add(source, identity=identity)
+        return bool(identity)
+
+    def normalize_feed_id(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        match = re.fullmatch(r"\d+_\d+_([^_]+)_?", text)
+        if match:
+            return match.group(1)
+        return text
+
     def mapping_feed_id(value: dict[str, Any]) -> str:
         for key in FEED_ID_KEYS:
             candidate = value.get(key)
             if candidate not in (None, ""):
-                return str(candidate)
+                return normalize_feed_id(candidate)
         if not best_mapping_image_source(value) and any(key in value for key in FEED_NODE_HINT_KEYS):
             for key in FEED_FALLBACK_ID_KEYS:
                 candidate = value.get(key)
                 if candidate not in (None, ""):
-                    return str(candidate)
+                    return normalize_feed_id(candidate)
         for key in FEED_ID_CONTAINER_KEYS:
             child = _json_mapping(value.get(key))
             if not child:
@@ -565,7 +685,7 @@ def extract_images(payload: dict[str, Any], *, fid: str = "", hostuin: int = 0) 
             for child_key in (*FEED_ID_KEYS, *FEED_FALLBACK_ID_KEYS):
                 candidate = child.get(child_key)
                 if candidate not in (None, ""):
-                    return str(candidate)
+                    return normalize_feed_id(candidate)
         return ""
 
     def mapping_hostuin(value: dict[str, Any]) -> int:
@@ -645,7 +765,8 @@ def extract_images(payload: dict[str, Any], *, fid: str = "", hostuin: int = 0) 
         seen_nodes.add(marker)
         if not belongs_to_target(value):
             return
-        add(best_mapping_image_source(value))
+        if add_mapping_image(value) and looks_like_qzone_photo(value):
+            return
         for key in IMAGE_HTML_KEYS:
             add_html_images(value.get(key))
         if depth <= 0:
@@ -682,7 +803,11 @@ def extract_images(payload: dict[str, Any], *, fid: str = "", hostuin: int = 0) 
             walk(child, scan_values=False)
     for key in IMAGE_HTML_KEYS:
         add_html_images(payload.get(key))
-    return images
+    return candidates
+
+
+def extract_images(payload: dict[str, Any], *, fid: str = "", hostuin: int = 0) -> list[str]:
+    return [item.url for item in _extract_image_candidates(payload, fid=fid, hostuin=hostuin)]
 
 
 def post_from_entry(
@@ -698,12 +823,16 @@ def post_from_entry(
     raw = detail_raw or entry_raw
     comments = extract_comments(raw or {})
     images: list[str] = []
+    seen_image_keys: set[str] = set()
     for source in (detail_raw, entry_raw, fallback):
         if not source:
             continue
-        for image in extract_images(source, fid=entry.fid, hostuin=entry.hostuin):
-            if image not in images:
-                images.append(image)
+        for image in _extract_image_candidates(source, fid=entry.fid, hostuin=entry.hostuin):
+            key = image.key or image.url
+            if key in seen_image_keys:
+                continue
+            seen_image_keys.add(key)
+            images.append(image.url)
     nickname = (
         _clean_nickname(entry.nickname, hostuin=entry.hostuin)
         or extract_nickname(detail_raw, hostuin=entry.hostuin)

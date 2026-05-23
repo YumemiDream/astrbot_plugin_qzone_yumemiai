@@ -526,6 +526,11 @@ def _adaptive_logical_width(
 ) -> int:
     requested = max(520, min(int(requested_width or 900), 1280))
     if post.media or post.attachments:
+        if len(post.media) == 1 and not post.attachments:
+            compact_len = len(re.sub(r"\s+", "", str(content_text or "")))
+            if compact_len <= 45:
+                return min(requested, 560)
+            return min(requested, 640 if compact_len <= 90 else 760)
         return max(640, requested)
 
     compact_len = len(re.sub(r"\s+", "", str(content_text or "")))

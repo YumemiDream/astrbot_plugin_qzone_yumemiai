@@ -2119,6 +2119,75 @@ def test_extract_images_collapses_aliases_from_one_qzone_photo_object() -> None:
     assert extract_images(payload) == ["https://m.qpic.cn/one-photo-original.jpg"]
 
 
+def test_extract_images_collapses_real_qzone_picdata_variants_by_photo_identity() -> None:
+    from qzone_bridge.social import extract_images
+
+    payload = {
+        "cell_pic": {
+            "picdata": [
+                {
+                    "albumid": "album-a",
+                    "lloc": "photo-a",
+                    "sloc": "https://qzone.example.test/photo-a-small.jpg",
+                    "photourl": {
+                        "0": {"url": "https://qzone.example.test/photo-a-original.jpg", "width": 1080, "height": 1935},
+                        "1": {"url": "https://qzone.example.test/photo-a-large.jpg", "width": 1080, "height": 1935},
+                        "11": {"url": "https://qzone.example.test/photo-a-thumb.jpg", "width": 400, "height": 716},
+                    },
+                }
+            ]
+        }
+    }
+
+    assert extract_images(payload) == ["https://qzone.example.test/photo-a-large.jpg"]
+
+
+def test_post_from_entry_deduplicates_real_msglist_detail_photo() -> None:
+    from qzone_bridge.models import FeedEntry
+    from qzone_bridge.social import post_from_entry
+
+    entry = FeedEntry(
+        hostuin=12345,
+        fid="fid-photo",
+        appid=311,
+        summary="photo",
+        raw={
+            "tid": "fid-photo",
+            "pic": [
+                {
+                    "pic_id": ",album-a,photo-a",
+                    "url1": "https://qzone.example.test/photo-a-small.jpg",
+                    "url2": "https://qzone.example.test/photo-a-large.jpg",
+                    "url3": "https://qzone.example.test/photo-a-original.jpg",
+                }
+            ],
+        },
+    )
+
+    post = post_from_entry(
+        entry,
+        detail={
+            "cell_id": {"cellid": "fid-photo"},
+            "cell_pic": {
+                "picdata": [
+                    {
+                        "albumid": "album-a",
+                        "lloc": "photo-a",
+                        "photourl": {
+                            "1": {"url": "https://qzone.example.test/photo-a-large.jpg"},
+                            "11": {"url": "https://qzone.example.test/photo-a-thumb.jpg"},
+                        },
+                    }
+                ]
+            },
+        },
+        fallback_raw=entry.raw,
+        local_id=1,
+    )
+
+    assert post.images == ["https://qzone.example.test/photo-a-large.jpg"]
+
+
 def test_extract_images_keeps_current_photo_when_photo_has_storage_key() -> None:
     from qzone_bridge.social import extract_images
 
@@ -2209,6 +2278,52 @@ def test_extract_feed_entry_reads_time_from_json_cell_comm() -> None:
     )
 
     assert entry.created_at == 1_690_000_000
+
+
+def test_extract_feed_entry_reads_real_msglist_comm_time() -> None:
+    from qzone_bridge.parser import extract_feed_entry
+
+    entry = extract_feed_entry(
+        {
+            "id": {"cellid": "fid-msglist"},
+            "comm": {
+                "appid": 311,
+                "time": 1_779_489_120,
+                "ugckey": "12345_311_fid-msglist_",
+                "ugcrightkey": "fid-msglist",
+            },
+            "summary": {"summary": "msglist text"},
+        },
+        default_hostuin=12345,
+    )
+
+    assert entry.fid == "fid-msglist"
+    assert entry.appid == 311
+    assert entry.created_at == 1_779_489_120
+    assert entry.summary == "msglist text"
+
+
+def test_extract_feed_entry_reads_real_shuoshuo_detail_cell_fields() -> None:
+    from qzone_bridge.parser import extract_feed_entry
+
+    entry = extract_feed_entry(
+        {
+            "cell_id": {"cellid": "fid-detail"},
+            "cell_comm": {
+                "appid": 311,
+                "time": 1_779_489_121,
+                "ugckey": "12345_311_fid-detail_",
+                "ugcrightkey": "fid-detail",
+            },
+            "cell_summary": {"summary": "detail text"},
+        },
+        default_hostuin=12345,
+    )
+
+    assert entry.fid == "fid-detail"
+    assert entry.appid == 311
+    assert entry.created_at == 1_779_489_121
+    assert entry.summary == "detail text"
 
 
 def test_detail_post_keeps_feed_raw_nickname_when_detail_omits_owner(tmp_path: Path) -> None:
@@ -2441,7 +2556,7 @@ def test_daemon_detail_feed_uses_legacy_feed_time_when_primary_detail_omits_time
         asyncio.run(service.client.close())
 
     entry = payload["entry"]
-    assert calls == ["detail", "legacy_recent"]
+    assert calls == ["detail", "legacy_profile", "legacy_recent"]
     assert entry["summary"] == "详情内容"
     assert entry["nickname"] == "详情昵称"
     assert entry["created_at"] == 1_690_000_000
@@ -2507,7 +2622,7 @@ def test_daemon_detail_feed_uses_legacy_feed_media_when_primary_detail_omits_ima
         asyncio.run(service.client.close())
 
     entry = payload["entry"]
-    assert calls == ["detail", "legacy_recent"]
+    assert calls == ["detail", "legacy_profile", "legacy_recent"]
     assert entry["raw"]["_feed_raw"]["pic"][0]["url1"] == "https://qzone.example.test/legacy-feed.jpg"
 
 
@@ -2578,7 +2693,7 @@ def test_daemon_detail_feed_ignores_neighbor_media_when_recovering_current_image
         asyncio.run(service.client.close())
 
     entry = payload["entry"]
-    assert calls == ["detail", "legacy_recent"]
+    assert calls == ["detail", "legacy_profile", "legacy_recent"]
     assert entry["raw"]["_feed_raw"]["pic"][0]["url3"] == "https://m.qpic.cn/current-image.jpg"
 
 

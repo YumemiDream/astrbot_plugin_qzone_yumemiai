@@ -642,6 +642,26 @@ class QzoneClient:
         )
         return payload
 
+    async def legacy_detail(self, hostuin: int, fid: str, *, num: int = 20, pos: int = 0) -> dict[str, Any]:
+        payload = await self._request_json(
+            "GET",
+            "https://h5.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msgdetail_v6",
+            params={
+                "uin": hostuin,
+                "tid": fid,
+                "num": max(1, int(num)),
+                "pos": max(0, int(pos)),
+                "not_trunc_con": 1,
+                "format": "json",
+            },
+            referer=f"https://user.qzone.qq.com/{hostuin}/mood/{fid}",
+            origin="https://user.qzone.qq.com",
+            hostuin=hostuin,
+            attach_token=False,
+            follow_qzone_redirects=True,
+        )
+        return payload
+
     async def mfeeds_get_count(self) -> dict[str, Any]:
         payload = await self._request_json(
             "GET",
@@ -1164,10 +1184,17 @@ class QzoneClient:
         raise QzoneRequestError(message, status_code=status_code, detail={"attempts": attempts}) from last_exc
 
     async def detail(self, hostuin: int, fid: str, *, appid: int = 311, busi_param: str = "") -> dict[str, Any]:
+        if int(appid or 0) == 311:
+            try:
+                return await self.legacy_detail(hostuin, fid)
+            except (QzoneRequestError, QzoneParseError) as exc:
+                log.debug("qzone legacy detail failed; falling back to h5 shuoshuo: %s", exc)
         payload = await self.shuoshuo(fid=fid, uin=hostuin, appid=appid, busi_param=busi_param)
         return payload
 
     def merge_cached_feed_entry(self, entry: FeedEntry) -> FeedEntry:
+        if not entry.fid:
+            return entry
         cached = self.feed_cache.get((entry.hostuin, entry.fid))
         if cached is None:
             return entry
@@ -1193,11 +1220,14 @@ class QzoneClient:
     def feed_entry_from_payload(self, payload: dict[str, Any], *, default_hostuin: int = 0) -> FeedEntry:
         entry = extract_feed_entry(payload, default_hostuin=default_hostuin)
         entry = self.merge_cached_feed_entry(entry)
-        self.feed_cache[(entry.hostuin, entry.fid)] = entry
+        if entry.fid:
+            self.feed_cache[(entry.hostuin, entry.fid)] = entry
         return entry
 
     def cache_feed_page(self, hostuin: int, items: list[FeedEntry]) -> None:
         for entry in items:
+            if not entry.fid:
+                continue
             self.feed_cache[(hostuin or entry.hostuin, entry.fid)] = entry
 
     def status_snapshot(self) -> dict[str, Any]:

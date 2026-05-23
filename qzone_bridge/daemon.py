@@ -385,7 +385,11 @@ class QzoneDaemonService:
                         if not self._should_fallback_feed_fetch(exc):
                             raise
                         log.warning("qzone self feed primary fetch failed, using legacy fallback: %s", exc)
-                        payload = await self.client.legacy_recent_feeds()
+                        try:
+                            payload = await self.client.legacy_feeds(hostuin, page=1, num=max(limit, 20))
+                        except (QzoneRequestError, QzoneParseError) as legacy_exc:
+                            log.warning("qzone msglist feed fallback failed, using recent feed fallback: %s", legacy_exc)
+                            payload = await self.client.legacy_recent_feeds()
                 else:
                     payload = unwrap_payload(await self.client.get_active_feeds(next_cursor))
                 feedpage = payload
@@ -448,8 +452,10 @@ class QzoneDaemonService:
 
         fetchers: list[Any] = []
         if hostuin == self.state.session.uin:
+            fetchers.append(lambda: self.client.legacy_feeds(hostuin, page=1, num=20))
             fetchers.append(self.client.legacy_recent_feeds)
-        fetchers.append(lambda: self.client.legacy_feeds(hostuin, page=1, num=20))
+        else:
+            fetchers.append(lambda: self.client.legacy_feeds(hostuin, page=1, num=20))
 
         for fetch in fetchers:
             try:

@@ -85,8 +85,11 @@ FEED_GENERIC_TIME_KEYS = (
 FEED_TIME_CONTAINER_KEYS = (
     "data",
     "common",
+    "comm",
     "cell_comm",
     "cellComm",
+    "cell_id",
+    "cellId",
     "feed",
     "feedInfo",
     "feedinfo",
@@ -600,6 +603,8 @@ def extract_hostuin(feed_item: dict[str, Any], default: int = 0) -> int:
         _html_attr(html_markup, "data-uin"),
         _html_attr(html_markup, "uin"),
         _dig(feed_item, "userinfo", "uin"),
+        _dig(feed_item, "cell_userinfo", "uin"),
+        _dig(feed_item, "cellUserInfo", "uin"),
         _dig(feed_item, "user", "uin"),
         _dig(feed_item, "userinfo", "user", "uin"),
         default,
@@ -616,27 +621,45 @@ def extract_hostuin(feed_item: dict[str, Any], default: int = 0) -> int:
     return default
 
 
+def _fid_from_ugc_key(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.fullmatch(r"\d+_\d+_([^_]+)_?", text)
+    if match:
+        return match.group(1)
+    return text
+
+
 def extract_fid(feed_item: dict[str, Any]) -> str:
     html_markup = _html_markup_candidates(feed_item)
     candidates = [
         feed_item.get("fid"),
         feed_item.get("tid"),
         feed_item.get("cellid"),
+        _dig(feed_item, "id", "cellid"),
+        _dig(feed_item, "cell_id", "cellid"),
+        _dig(feed_item, "cellId", "cellid"),
+        _dig(feed_item, "common", "ugcrightkey"),
+        _dig(feed_item, "comm", "ugcrightkey"),
+        _dig(feed_item, "cell_comm", "ugcrightkey"),
+        _dig(feed_item, "cellComm", "ugcrightkey"),
         feed_item.get("key"),
-        feed_item.get("ugckey"),
         feed_item.get("ugcrightkey"),
+        feed_item.get("ugckey"),
+        _dig(feed_item, "common", "ugckey"),
+        _dig(feed_item, "comm", "ugckey"),
+        _dig(feed_item, "cell_comm", "ugckey"),
+        _dig(feed_item, "cellComm", "ugckey"),
         _html_attr(html_markup, "data-fid"),
         _html_attr(html_markup, "fid"),
         _html_attr(html_markup, "data-tid"),
         _html_attr(html_markup, "tid"),
         _html_attr(html_markup, "data-cellid"),
-        _dig(feed_item, "id", "cellid"),
-        _dig(feed_item, "common", "ugcrightkey"),
-        _dig(feed_item, "common", "ugckey"),
     ]
     for candidate in candidates:
         if candidate:
-            return str(candidate)
+            return _fid_from_ugc_key(candidate)
     return ""
 
 
@@ -645,7 +668,11 @@ def extract_summary_text(feed_item: dict[str, Any]) -> str:
         _text(feed_item.get("content")),
         _text(feed_item.get("con")),
         _dig(feed_item, "summary", "summary"),
+        _dig(feed_item, "cell_summary", "summary"),
+        _dig(feed_item, "cellSummary", "summary"),
         _text(feed_item.get("summary")),
+        _text(feed_item.get("cell_summary")),
+        _text(feed_item.get("cellSummary")),
         _dig(feed_item, "original", "summary", "summary"),
         _text(feed_item.get("text")),
         _html_to_text(feed_item.get("html")),
@@ -686,11 +713,23 @@ def extract_feed_entry(
     default_hostuin: int = 0,
     nickname_context: dict[str, Any] | None = None,
 ) -> FeedEntry:
-    common = _json_mapping(feed_item.get("common")) or _json_mapping(feed_item.get("cell_comm")) or {}
-    userinfo = _json_mapping(feed_item.get("userinfo")) or _json_mapping(feed_item.get("user")) or {}
+    common = (
+        _json_mapping(feed_item.get("common"))
+        or _json_mapping(feed_item.get("comm"))
+        or _json_mapping(feed_item.get("cell_comm"))
+        or _json_mapping(feed_item.get("cellComm"))
+        or {}
+    )
+    userinfo = (
+        _json_mapping(feed_item.get("userinfo"))
+        or _json_mapping(feed_item.get("cell_userinfo"))
+        or _json_mapping(feed_item.get("cellUserInfo"))
+        or _json_mapping(feed_item.get("user"))
+        or {}
+    )
     like = _json_mapping(feed_item.get("like")) or {}
     comment = _json_mapping(feed_item.get("comment")) or {}
-    operation = _json_mapping(feed_item.get("operation")) or {}
+    operation = _json_mapping(feed_item.get("operation")) or _json_mapping(feed_item.get("cell_operation")) or {}
     original = _json_mapping(feed_item.get("original")) or {}
     html_markups = _html_markup_candidates(feed_item)
     html_markup = html_markups[0] if html_markups else None
