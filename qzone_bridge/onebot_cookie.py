@@ -11,6 +11,37 @@ from .parser import cookie_header, normalize_cookie_fields, normalize_uin, parse
 
 COOKIE_ACTIONS = ("get_cookies", "get_credentials")
 LOGIN_INFO_ACTIONS = ("get_login_info",)
+ONEBOT_ACTION_CALLER_ATTRS = (
+    "call_action",
+    "call_api",
+    "request",
+    "call",
+    "send_api",
+    "send_action",
+    "request_api",
+    "api_call",
+    "callAction",
+    "callApi",
+    "sendAction",
+    "sendApi",
+    "requestAction",
+    "requestApi",
+)
+ONEBOT_ACTION_OWNER_ATTRS = (
+    "api",
+    "client",
+    "bot",
+    "onebot",
+    "cqhttp",
+    "api_client",
+    "adapter",
+    "platform",
+    "protocol",
+    "connection",
+    "websocket",
+    "ws",
+    "http",
+)
 COOKIE_DOMAIN_FALLBACKS = ("user.qzone.qq.com", "qzone.qq.com", "h5.qzone.qq.com", "mobile.qzone.qq.com")
 COOKIE_VALUE_KEYS = (
     "cookies",
@@ -327,19 +358,112 @@ async def call_onebot_action(bot: Any, action: str, **params: Any) -> Any:
 
     method = getattr(bot, action, None)
     if callable(method):
-        result = method(**params)
+        result = _invoke_onebot_action_callable(method, "", params)
         if inspect.isawaitable(result):
             return await result
         return result
 
-    call_action = getattr(bot, "call_action", None)
-    if not callable(call_action):
-        raise AttributeError("OneBot client does not expose call_action")
+    callers = list(iter_onebot_action_callers(bot))
+    if not callers:
+        raise AttributeError("OneBot client does not expose a supported action caller")
 
-    result = call_action(action, **params)
-    if inspect.isawaitable(result):
-        return await result
-    return result
+    last_error: TypeError | None = None
+    for call_action in callers:
+        try:
+            result = _invoke_onebot_action_callable(call_action, action, params)
+        except TypeError as exc:
+            last_error = exc
+            continue
+        if inspect.isawaitable(result):
+            return await result
+        return result
+    if last_error is not None:
+        raise last_error
+    raise AttributeError("OneBot client does not expose a supported action caller")
+
+
+def iter_onebot_action_callers(bot: Any) -> tuple[Any, ...]:
+    """Return callable API dispatchers from common OneBot protocol-client wrappers."""
+
+    callers: list[Any] = []
+    seen_owners: set[int] = set()
+    seen_callers: set[int] = set()
+    owners: list[Any] = [bot]
+    index = 0
+    while index < len(owners):
+        owner = owners[index]
+        index += 1
+        if owner is None:
+            continue
+        owner_id = id(owner)
+        if owner_id in seen_owners:
+            continue
+        seen_owners.add(owner_id)
+        for attr in ONEBOT_ACTION_CALLER_ATTRS:
+            try:
+                caller = getattr(owner, attr, None)
+            except Exception:
+                caller = None
+            if callable(caller):
+                caller_id = id(caller)
+                if caller_id not in seen_callers:
+                    seen_callers.add(caller_id)
+                    callers.append(caller)
+        for attr in ONEBOT_ACTION_OWNER_ATTRS:
+            try:
+                nested = getattr(owner, attr, None)
+            except Exception:
+                nested = None
+            if nested is not None and id(nested) not in seen_owners:
+                owners.append(nested)
+    return tuple(callers)
+
+
+def _invoke_onebot_action_callable(call_action: Any, action: str, params: dict[str, Any]) -> Any:
+    """Invoke OneBot client callables across common protocol-end wrappers."""
+
+    attempts: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    if action:
+        envelope_params = dict(params)
+        attempts.extend(
+            [
+                ((action,), dict(params)),
+                ((), {"action": action, **params}),
+                ((action, params), {}),
+                ((action,), {"params": params}),
+                ((), {"action": action, "params": params}),
+                (({"action": action, "params": envelope_params},), {}),
+                (({"action": action, "data": envelope_params},), {}),
+                (({"action": action, "payload": envelope_params},), {}),
+                (({"api": action, "params": envelope_params},), {}),
+                (({"api": action, "data": envelope_params},), {}),
+                ((action,), {"data": params}),
+                ((), {"action": action, "data": params}),
+                ((action,), {"payload": params}),
+                ((), {"action": action, "payload": params}),
+            ]
+        )
+    else:
+        attempts.extend(
+            [
+                ((), dict(params)),
+                ((params,), {}),
+                ((), {"params": params}),
+                ((), {"data": params}),
+                ((), {"payload": params}),
+            ]
+        )
+
+    last_error: TypeError | None = None
+    for args, kwargs in attempts:
+        try:
+            return call_action(*args, **kwargs)
+        except TypeError as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        raise last_error
+    return call_action(action, **params) if action else call_action(**params)
 
 
 async def fetch_cookie_text(bot: Any, *, domain: str) -> str:

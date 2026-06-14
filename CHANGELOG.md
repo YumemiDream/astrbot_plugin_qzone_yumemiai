@@ -2,6 +2,74 @@
 
 ## 未发布
 
+## v0.7.0 - 2026-06-14
+
+- 新增：完成 QQ 空间 H5 原生视频直发稳定化，统一采用 Cookie/`p_skey` + `video_qzone`/`pic_qzone` + `emotion_cgi_publish_v6` + `emotion_cgi_update` 的公开修复链路。
+- 新增：daemon 会在视频发布前确保封面绑定真实公开相册，并在发布后保留/发现 `tid/fid`，再校验同一 `sVid`、`appid=311` 和全部人可见。
+- 修复：不再把视频封面图、OneBot 协议端发布 action、QQ upload A2/vLoginData 或只回显 `richval` 的响应当成视频发布成功。
+- 修复：`/qzone autovideoauth` 改为确保 QQ 空间 Cookie/`p_skey` 可用；状态中的“视频直发：可用（公开视频校验）”表示 Cookie/H5 公开创建 + 权限修复 + 公开校验链路可用。
+- 优化：`/qzone status` 改为中文摘要，只保留服务、账号、登录态、视频直发和必要提示，不再把内部诊断字段原样堆给管理员。
+- 文档：README、配置说明、OneBot 视频发布契约和 daemon 逆向记录已统一补充中文说明，明确缺少 Cookie、权限更新失败或公开视频校验失败时必须拒绝成功。
+- 测试：补充并保留 H5 视频上传、公开相册绑定、权限更新、公开校验和失败阻断相关回归用例。
+
+## v0.6.8 - 2026-06-01
+
+- 新增：daemon 原生视频直发接入 `UploadVideoInfoReq.vBusiNessData`，按 QQ 空间录制视频说说路径编码 `UniAttribute(hostuin, publishmood)`，并使用 `iBusiNessType=1` 随 Tencent upload 控制包提交。
+- 新增：支持通过 `QZONE_VIDEO_UPLOAD_LOGIN_DATA_B64`、`QZONE_VIDEO_UPLOAD_LOGIN_KEY_B64` 和 `QZONE_VIDEO_UPLOAD_TOKEN_*` 提供 QQ upload 二进制登录材料；未配置时的旧封面图回退行为已被后续版本废除。
+- 修复：有 daemon 上传凭据时，插件入口会把原始视频交给本地 daemon，发布结果渲染仍使用视频封面。
+- 文档：更新 daemon 原生视频逆向记录，明确普通视频说说的发布体嵌在上传业务数据中，`rptVSUploadFinish` 更像上传完成上报，不再把“最终发布 RPC”列为当前主阻塞点。
+- 测试：补充 publishmood OldUniAttribute 编码、环境凭据解析、daemon 直发分支和插件入口选择的回归用例。
+
+## v0.6.7 - 2026-06-01
+
+- 新增：实现 Tencent upload SDK 所需的最小 JCE/Tars 编解码层，覆盖 `AuthToken`、`FileControlReq`、`FileBatchControlReq/Rsp`、`FileUploadReq/Rsp`、`UploadVideoInfoReq/Rsp` 等已确认 schema。
+- 新增：`QzoneTencentVideoUploader` 支持按 `video_qzone` 协议发送控制包和分片包，并能解析最终 `sVid/iBusiNessType/vBusiNessData` 上传响应；没有 `vLoginData` 时会明确报缺少 QQ upload 二进制登录材料。
+- 文档：更新 daemon 原生视频发布逆向记录，标明 JCE 与 socket 上传层已落地，剩余阻塞点收敛为 `vLoginData/vLoginKey` 来源和消费 `sVid/vBusiNessData` 的最终 QQ 空间发布 RPC。
+- 测试：补充 JCE 字段 tag、嵌套 map/struct、上传响应解码、分片上传 fake socket 流程和 SHA1 校验回归用例。
+
+## v0.6.6 - 2026-06-01
+
+- 新增：沉淀 QQ 空间 daemon 原生视频直发的 Tencent upload SDK 协议骨架，记录 `video_qzone`、`video.upqzfile.com:80`、控制包 cmd=1、分片包 cmd=2、PDU header offset 和 `0x04/0x05` 帧格式。
+- 新增：`qzone_bridge.tencent_upload` 提供可测试的 PDU 编解码与 daemon 原生视频上传探针，后续补 JCE/Tars 和 QQ upload 登录材料时可直接接入。
+- 文档：更新 daemon 原生视频发布逆向记录，明确现阶段真正缺口是 JCE/Tars schema、`vLoginData/vLoginKey`/`AuthToken` 来源，以及成功上传后消费 `sVid/vBusiNessData` 的最终发布 RPC。
+- 测试：补充 Tencent upload PDU round-trip、畸形帧拒绝和 daemon 原生视频协议探针回归用例。
+
+## v0.6.5 - 2026-06-01
+
+- 修复：aiocqhttp/OneBot 视频引用继续按协议字段兼容，不绑定 NapCat；`get_file` 现在会兼容 LLOneBot 的 `base64` 返回，以及 `file_id/file/fid/id`、OneBot v12 风格 `type=path/url` 等常见文件参数组合。
+- 修复：群/私聊文件直链兜底会同时尝试 `group_id/group`、`busid` 和 `file_id/file` 参数形态，优先覆盖 LLOneBot、NapCat、Shamrock 等协议端差异。
+- 新增：OneBot 返回 base64 视频时会先落盘到插件缓存，再按正常视频流程提取封面和渲染卡片，避免只返回 base64 时误报“视频文件不存在”。
+- 测试：补充 LLOneBot `get_file` base64 视频、base64 视频本地化、引用视频 fallback 参数组合回归用例。
+
+## v0.6.4 - 2026-06-01
+
+- 修复：aiocqhttp/OneBot 视频引用不再只按 NapCat 字段解析，新增兼容 `download_url`、`file_url`、`media_url`、`cdn_url`、`file_path`、`absolute_path`、`local_path` 等协议端字段，覆盖 LLOneBot、NapCat、Shamrock 等常见返回组合。
+- 修复：引用视频只有 `file_id` 或裸 `file=xxx.mp4` 时仍不会误当成本地路径；会优先使用真实 URL/可读本地文件，再走 `get_file`、`get_group_file_url`、`get_private_file_url` 兜底。
+- 文档：新增 QQ 空间 daemon 原生视频发布逆向记录，明确当前真视频直发需要复现 QQ 客户端的 `QZoneVideoUploadTask` / Tencent upload SDK 上传协议；旧的 daemon 视频封面图回退已被后续版本废除。
+- 测试：补充协议端 `download_url`、对象 `file_url`、`get_file` 返回下载地址、群文件 URL 返回地址等回归用例。
+
+## v0.6.3 - 2026-06-01
+
+- 修复：引用视频时不再把不存在的 NTQQ/OneBot 本地缓存路径（例如 `D:Documents\Tencent Files\...\Video\...\xxx.mp4`）直接当作可提取封面的文件；只有当前机器确实可读的本地视频路径才会进入发布流程。
+- 修复：aiocqhttp/OneBot 视频段同时带有坏 `path` 与可用 `url`、`file_id`、组件 `convert_to_file_path()` 时，现在会继续走可用来源，兼容 llbot、NapCat、Shamrock 等不同协议端字段组合。
+- 测试：补充不存在视频路径、坏路径优先级、`get_file` fallback、AstrBot `Reply.chain` 视频组件转换等回归用例，防止再次出现“视频文件不存在，无法提取封面”。
+
+## v0.6.2 - 2026-06-01
+
+- 修复：引用视频现在按 aiocqhttp/OneBot 通用消息结构解析，不再只依赖某一个协议端；支持从结构化消息、CQ/raw_message、AstrBot `Reply.chain` 视频组件和 `get_msg` 返回体中提取真实视频源。
+- 修复：当 llbot、NapCat、Shamrock 等协议端只返回 `file=xxx.mp4`、`file_id` 或 `empty` 占位字段时，不再把裸文件名误当成本地路径；会优先使用真实 `url/path`，再尝试 OneBot `get_file`、群/私聊文件 URL 扩展补全。
+- 修复：`type=file` 的 mp4/video MIME 附件会按视频处理，不再拼成 `[文件:xxx]` 文本写进说说；daemon 直发视频也会先本地化视频源再提取封面。
+
+## v0.6.1 - 2026-06-01
+
+- 修复：引用 NTQQ/OneBot 视频时会优先补查引用消息并读取真实视频段；若平台只返回视频 URL，会先下载到插件缓存再提取封面，避免把 `file=xxx.mp4` 文件名误当成本地路径导致“视频文件不存在，无法提取封面”。
+- 修复：本地视频路径恢复改为通用归一化（盘符斜杠、`file://` 路径、换行/制表符转义），不再扫描固定 Tencent 目录。
+
+- 新增：发说说支持引用本地视频消息，兼容 mp4、mov、mkv、webm、avi、flv、3gp 等常见格式；早期单个本地视频会优先唤起 QQ/QQNT 原生 `mqqapi://qzone/publish` 视频发布窗口（当前运行路径已废除该客户端 handoff）。
+- 新增：早期版本在原生视频入口不可用时曾使用 ffmpeg 提取视频封面并按图片发布；该视频封面替代路径已被后续版本废除。
+- 优化：发布结果渲染会使用视频封面并叠加播放标识，管理员可直接确认本次引用的视频内容。
+- 修复：视频消息不再被拼成 `[视频:xxx] 本地路径` 写进说说正文，避免泄露本地缓存路径并导致发布内容异常。
+
 ## v0.6.0 - 2026-06-01
 
 - 新增：支持 Google News RSS 新闻自动说说，可配置中国新闻、国际新闻、混合范围、关键词和自定义 Google News RSS 地址，由 LLM 改写成原创短评后定时发布。

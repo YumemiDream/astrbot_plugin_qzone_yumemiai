@@ -19,7 +19,8 @@ import httpx
 from . import BRIDGE_API_VERSION, __version__ as BRIDGE_VERSION
 from .astrbot_logging import get_logger
 from .errors import DaemonUnavailableError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
-from .media import sanitize_publish_content
+from .h5_video import qzone_h5_video_upload_available
+from .media import is_video_media, sanitize_publish_content
 from .models import SessionState
 from .parser import normalize_uin, parse_cookie_text
 from .protocol import SECRET_HEADER
@@ -28,7 +29,22 @@ from .utils import now_iso
 
 log = get_logger(__name__)
 SENSITIVE_DETAIL_KEYS = {"cookie", "cookies", "p_skey", "skey", "pt4_token", "pt_key", "qzonetoken", "secret", "token"}
-SENSITIVE_URL_QUERY_KEYS = {"g_tk", "gtk", "p_skey", "skey", "pt4_token", "pt_key", "qzonetoken", "token", "secret"}
+SENSITIVE_URL_QUERY_KEYS = {
+    "g_tk",
+    "gtk",
+    "p_skey",
+    "skey",
+    "pt4_token",
+    "pt_key",
+    "qzonetoken",
+    "token",
+    "secret",
+    "rkey",
+    "rk",
+    "lvkey",
+}
+DAEMON_MEDIA_PUBLISH_TIMEOUT_SECONDS = 300.0
+DAEMON_VIDEO_PUBLISH_TIMEOUT_SECONDS = 7200.0
 
 
 def _port_is_free(port: int) -> bool:
@@ -237,6 +253,7 @@ class QzoneDaemonController:
         self._lock = asyncio.Lock()
         self._process: subprocess.Popen | None = None
         self._health_cache: tuple[int, str, bool, float] | None = None
+        self._health_cache_data: tuple[int, str, dict[str, Any]] | None = None
         self._health_cache_ttl = 1.0
         self._incompatible_daemon: tuple[int, str] | None = None
 
@@ -334,6 +351,7 @@ class QzoneDaemonController:
 
     def _invalidate_health_cache(self) -> None:
         self._health_cache = None
+        self._health_cache_data = None
 
     @staticmethod
     def _health_data(payload: dict[str, Any]) -> dict[str, Any]:
@@ -363,6 +381,48 @@ class QzoneDaemonController:
             and self._bridge_api_version_from_health(payload) >= BRIDGE_API_VERSION
             and str(data.get("daemon_version") or "") == BRIDGE_VERSION
         )
+
+    def _cached_health_data(self, port: int | None = None, secret: str | None = None) -> dict[str, Any]:
+        runtime = self._runtime()
+        resolved_port = int(port or runtime.daemon_port or self.default_port or 0)
+        resolved_secret = secret or runtime.secret
+        if not self._health_cache_data:
+            return {}
+        cached_port, cached_secret, data = self._health_cache_data
+        if cached_port == resolved_port and cached_secret == resolved_secret:
+            return dict(data)
+        return {}
+
+    @staticmethod
+    def _merge_health_status(status: dict[str, Any], health_data: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(health_data, dict) or not health_data:
+            return status
+        merged = dict(status)
+        public_keys = {
+            "daemon_state",
+            "daemon_pid",
+            "daemon_port",
+            "daemon_version",
+            "bridge_api_version",
+            "started_at",
+            "last_seen_at",
+            "uptime_seconds",
+            "login_uin",
+            "session_source",
+            "cookie_summary",
+            "cookie_count",
+            "needs_rebind",
+            "last_ok_at",
+            "last_error",
+            "video_upload",
+            "qzonetoken_hosts",
+            "feed_cache_size",
+            "session_revision",
+        }
+        for key in public_keys:
+            if key in health_data:
+                merged[key] = health_data[key]
+        return merged
 
     async def _stop_incompatible_daemon(self, port: int, secret: str) -> None:
         if self._incompatible_daemon != (int(port or 0), secret):
@@ -459,6 +519,7 @@ class QzoneDaemonController:
                 self._invalidate_health_cache()
                 return False
             self._incompatible_daemon = None
+            self._health_cache_data = (resolved_port, resolved_secret, dict(self._health_data(payload)))
             self._health_cache = (
                 resolved_port,
                 resolved_secret,
@@ -472,6 +533,30 @@ class QzoneDaemonController:
     def _status_from_state(self, state, *, daemon_state: str) -> dict[str, Any]:
         runtime = state.runtime
         needs_rebind = self._session_needs_rebind(state.session)
+        video_upload = state.video_upload.summary()
+        h5_ready = qzone_h5_video_upload_available(state.session)
+        state_qq_upload_ready = bool(video_upload.get("configured"))
+        ready = bool(h5_ready)
+        video_upload["qq_upload_configured"] = False
+        video_upload["qq_upload_state_configured"] = state_qq_upload_ready
+        video_upload["web_cookie_configured"] = h5_ready
+        video_upload["h5_upload_available"] = h5_ready
+        video_upload["h5_upload_diagnostic_available"] = h5_ready
+        video_upload["h5_publish_supported"] = h5_ready
+        video_upload["h5_publish_permission_update_required"] = h5_ready
+        video_upload["h5_publish_verified"] = h5_ready
+        video_upload["h5_publish_verification_required"] = h5_ready
+        video_upload["ready"] = ready
+        video_upload["verification_required"] = ready
+        video_upload["configured"] = False
+        if h5_ready:
+            video_upload["method"] = "h5_video_publish_update_visibility"
+            video_upload["stability"] = "public_create_without_pic_fakefeed_then_permission_repair_and_public_verification"
+            if not video_upload.get("updated_at"):
+                video_upload["updated_at"] = state.session.updated_at
+        else:
+            video_upload["method"] = ""
+            video_upload["requires"] = "qzone_web_cookie_p_skey"
         return {
             "daemon_state": daemon_state,
             "daemon_pid": runtime.daemon_pid,
@@ -487,6 +572,7 @@ class QzoneDaemonController:
             "needs_rebind": needs_rebind,
             "last_ok_at": state.session.last_ok_at,
             "last_error": state.session.last_error,
+            "video_upload": video_upload,
             "qzonetoken_hosts": sorted(int(k) for k in state.session.qzonetokens.keys() if str(k).isdigit()),
             "feed_cache_size": 0,
             "session_revision": state.session.revision,
@@ -514,7 +600,10 @@ class QzoneDaemonController:
             runtime = self._runtime()
             port = runtime.daemon_port or self.default_port
             if await self._probe_health(port):
-                return self._status_from_state(self.store.read(), daemon_state="ready")
+                return self._merge_health_status(
+                    self._status_from_state(self.store.read(), daemon_state="ready"),
+                    self._cached_health_data(port, runtime.secret),
+                )
             await self._stop_incompatible_daemon(port, runtime.secret)
 
             if not self._daemon_script().exists():
@@ -573,7 +662,10 @@ class QzoneDaemonController:
                             True,
                             asyncio.get_running_loop().time() + self._health_cache_ttl,
                         )
-                        return self._status_from_state(state, daemon_state="ready")
+                        return self._merge_health_status(
+                            self._status_from_state(state, daemon_state="ready"),
+                            self._cached_health_data(port, runtime.secret),
+                        )
                     if self._process and self._process.poll() is not None:
                         break
                     await asyncio.sleep(0.5)
@@ -600,6 +692,8 @@ class QzoneDaemonController:
         *,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
+        timeout: float | None = None,
+        retry_on_timeout: bool = True,
     ) -> Any:
         last_exc: httpx.HTTPError | None = None
         response: httpx.Response | None = None
@@ -611,31 +705,39 @@ class QzoneDaemonController:
             elif not await self._probe_health(runtime.daemon_port):
                 raise DaemonUnavailableError("daemon 未运行")
             try:
-                response = await self._client.request(
-                    method,
-                    f"{self._base_url(runtime.daemon_port)}{path}",
-                    headers={SECRET_HEADER: runtime.secret},
-                    params=params,
-                    json=json_body,
-                )
+                request_kwargs: dict[str, Any] = {
+                    "headers": {SECRET_HEADER: runtime.secret},
+                    "params": params,
+                    "json": json_body,
+                }
+                if timeout is not None:
+                    request_kwargs["timeout"] = max(float(timeout), float(self.request_timeout or 0.001))
+                response = await self._client.request(method, f"{self._base_url(runtime.daemon_port)}{path}", **request_kwargs)
                 break
             except httpx.HTTPError as exc:
                 self._invalidate_health_cache()
                 last_exc = exc
+                detail = self._daemon_request_error_detail(exc, path=path, runtime=runtime, attempt=attempt + 1, timeout=timeout)
+                if isinstance(exc, httpx.TimeoutException) and not retry_on_timeout:
+                    raise DaemonUnavailableError("daemon 请求失败", detail=detail) from exc
                 if not self.auto_start_daemon or attempt > 0:
-                    raise DaemonUnavailableError(
-                        "daemon 请求失败",
-                        detail={"error": str(exc), "path": path},
-                    ) from exc
+                    raise DaemonUnavailableError("daemon 请求失败", detail=detail) from exc
         if response is None:
             raise DaemonUnavailableError(
                 "daemon 请求失败",
-                detail={"error": str(last_exc), "path": path},
+                detail=self._daemon_request_error_detail(last_exc, path=path, runtime=self._runtime(), attempt=2, timeout=timeout),
             )
         try:
             payload = response.json()
         except Exception as exc:
-            raise DaemonUnavailableError("daemon 返回的 JSON 无法解析", detail={"text": response.text[:500]}) from exc
+            raise DaemonUnavailableError(
+                "daemon 返回的 JSON 无法解析",
+                detail={
+                    "status_code": response.status_code,
+                    "content_type": response.headers.get("content-type", ""),
+                    "body_preview": response.text[:500],
+                },
+            ) from exc
         if not payload.get("ok", False):
             error = payload.get("error") or {}
             code = str(error.get("code") or "DAEMON_ERROR")
@@ -657,16 +759,46 @@ class QzoneDaemonController:
             raise DaemonUnavailableError(message, detail=detail)
         return payload.get("data")
 
+    def _daemon_request_error_detail(
+        self,
+        exc: BaseException | None,
+        *,
+        path: str,
+        runtime: Any,
+        attempt: int,
+        timeout: float | None,
+    ) -> dict[str, Any]:
+        error_type = type(exc).__name__ if exc is not None else ""
+        error_text = str(exc or "") or error_type
+        return {
+            "error": error_text,
+            "error_type": error_type,
+            "path": path,
+            "attempt": int(attempt or 0),
+            "daemon_port": int(getattr(runtime, "daemon_port", 0) or self.default_port or 0),
+            "timeout": float(timeout if timeout is not None else self.request_timeout),
+        }
+
+    def _publish_request_timeout(self, media: list[dict[str, Any]] | None) -> float | None:
+        items = list(media or [])
+        if any(is_video_media(item) for item in items):
+            return max(float(self.request_timeout or 0.0), DAEMON_VIDEO_PUBLISH_TIMEOUT_SECONDS)
+        if items:
+            return max(float(self.request_timeout or 0.0), DAEMON_MEDIA_PUBLISH_TIMEOUT_SECONDS)
+        return None
+
     async def get_status(self, *, probe_daemon: bool = True) -> dict[str, Any]:
         state = self.store.read()
         runtime = state.runtime
         needs_rebind = self._session_needs_rebind(state.session)
         daemon_state = "offline"
+        health_data: dict[str, Any] = {}
         if probe_daemon and runtime.daemon_port and await self._probe_health(runtime.daemon_port):
-            daemon_state = "needs_rebind" if needs_rebind else "ready"
+            health_data = self._cached_health_data(runtime.daemon_port, runtime.secret)
+            daemon_state = str(health_data.get("daemon_state") or ("needs_rebind" if needs_rebind else "ready"))
         elif state.session.cookies:
             daemon_state = "needs_rebind" if needs_rebind else "degraded"
-        return self._status_from_state(state, daemon_state=daemon_state)
+        return self._merge_health_status(self._status_from_state(state, daemon_state=daemon_state), health_data)
 
     @staticmethod
     def cookie_summary(cookies: dict[str, str]) -> str:
@@ -783,15 +915,33 @@ class QzoneDaemonController:
         content_sanitized: bool = False,
     ) -> dict[str, Any]:
         content = sanitize_publish_content(content, content_sanitized=content_sanitized)
+        media_items = media or []
         return await self._request(
             "POST",
             "/post",
             json_body={
                 "content": content,
                 "sync_weibo": sync_weibo,
-                "media": media or [],
+                "media": media_items,
                 "content_sanitized": True,
             },
+            timeout=self._publish_request_timeout(media_items),
+            retry_on_timeout=False,
+        )
+
+    async def verify_native_video_feed(
+        self,
+        *,
+        vid: str,
+        fid: str = "",
+        method: str = "h5_video_publish_update_visibility",
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/native-video/verify",
+            json_body={"vid": vid, "fid": fid, "method": method},
+            timeout=DAEMON_MEDIA_PUBLISH_TIMEOUT_SECONDS,
+            retry_on_timeout=False,
         )
 
     async def comment_post(

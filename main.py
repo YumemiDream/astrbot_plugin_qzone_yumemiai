@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import os
 import inspect
@@ -16,7 +17,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from astrbot.api import logger
@@ -32,7 +33,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026060101
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026061301
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -51,7 +52,20 @@ SENSITIVE_LOG_KEYS = {
     "secret",
     "token",
 }
-SENSITIVE_URL_QUERY_KEYS = {"g_tk", "gtk", "p_skey", "skey", "pt4_token", "pt_key", "qzonetoken", "token", "secret"}
+SENSITIVE_URL_QUERY_KEYS = {
+    "g_tk",
+    "gtk",
+    "p_skey",
+    "skey",
+    "pt4_token",
+    "pt_key",
+    "qzonetoken",
+    "token",
+    "secret",
+    "rkey",
+    "rk",
+    "lvkey",
+}
 LLM_INTERNAL_KEYS = SENSITIVE_LOG_KEYS | {"raw", "cursor", "fid", "curkey", "unikey", "busi_param"}
 LLM_REPLY_FORBIDDEN_TERMS = (
     "Result:",
@@ -497,6 +511,9 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
     if package is None:
         return False
     _verify_local_qzone_bridge_module("qzone_bridge", package_root)
+    expected_version = _local_qzone_bridge_expected_version(package_root)
+    if expected_version and str(getattr(package, "__version__", "") or "") != expected_version:
+        return False
     try:
         if int(getattr(package, "BRIDGE_API_VERSION", 0) or 0) < REQUIRED_QZONE_BRIDGE_API_VERSION:
             return False
@@ -524,6 +541,13 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
                     return False
 
     contract_attributes = {
+        "qzone_bridge.media": (
+            "base64_media_source",
+            "collapse_single_video_cover_companion_media",
+            "collect_message_media",
+            "collect_post_payload",
+            "parse_cq_message",
+        ),
         "qzone_bridge.page_api": ("PAGE_DETAIL_TIMEOUT_SECONDS", "PAGE_STATUS_TIMEOUT_SECONDS"),
         "qzone_bridge.publish_renderer": ("combine_rendered_post_cards", "SUPPORTS_COMMENT_RESULT_SECTIONS"),
         "qzone_bridge.social": ("extract_nickname",),
@@ -571,6 +595,7 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
                 "news_once_per_day",
                 "news_max_post_length",
                 "news_trust_env",
+                "native_video_publish",
             )
         },
     }
@@ -612,6 +637,15 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
             except (TypeError, ValueError):
                 return False
     return True
+
+
+def _local_qzone_bridge_expected_version(package_root: Path) -> str:
+    try:
+        text = (package_root / "__init__.py").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    match = re.search(r"(?m)^__version__\s*=\s*['\"]([^'\"]+)['\"]", text)
+    return match.group(1).strip() if match else ""
 
 
 def _evict_local_qzone_bridge_modules(package_root: Path) -> None:
@@ -665,9 +699,36 @@ from qzone_bridge.auto_comment import (
 )
 from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.drafts import DraftPost, DraftStore
-from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneCookieAcquireError, QzoneNeedsRebind
+from qzone_bridge.errors import (
+    DaemonUnavailableError,
+    QzoneBridgeError,
+    QzoneCookieAcquireError,
+    QzoneNeedsRebind,
+    QzoneParseError,
+    QzoneRequestError,
+)
 from qzone_bridge.llm import QzoneLLM
-from qzone_bridge.media import PostMedia, PostPayload, collect_post_payload, normalize_media_list, source_name
+from qzone_bridge.local_media import resolve_trusted_local_media_path
+from qzone_bridge.media import (
+    MEDIA_BASE64_SOURCE_KEYS,
+    MEDIA_LOCAL_SOURCE_KEYS,
+    MEDIA_URL_SOURCE_KEYS,
+    PostMedia,
+    PostPayload,
+    QZONE_VIDEO_SUFFIXES,
+    base64_media_source,
+    collapse_single_video_cover_companion_media,
+    collect_message_media,
+    collect_post_payload,
+    guess_mime_type,
+    is_video_media,
+    iter_event_components,
+    iter_reference_message_ids,
+    normalize_media_list,
+    normalize_source,
+    parse_cq_message,
+    source_name,
+)
 from qzone_bridge.models import FeedEntry
 from qzone_bridge.news import (
     GoogleNewsRSSClient,
@@ -678,11 +739,18 @@ from qzone_bridge.news import (
     merge_news_items,
     normalize_news_scopes,
 )
-from qzone_bridge.onebot_cookie import fetch_cookie_text
+from qzone_bridge.onebot_cookie import (
+    COOKIE_ACTIONS,
+    ONEBOT_ACTION_CALLER_ATTRS,
+    ONEBOT_ACTION_OWNER_ATTRS,
+    fetch_cookie_text,
+    iter_onebot_action_callers,
+)
 from qzone_bridge.parser import normalize_uin, parse_cookie_text
 from qzone_bridge.page_api import QzonePageApi, page_error_payload
 from qzone_bridge.post_service import QzonePostService
 from qzone_bridge.posts import PostStore
+from qzone_bridge.video import materialize_video_covers, materialize_video_sources
 import qzone_bridge.publish_renderer as _publish_renderer
 try:
     import qzone_bridge.compat as _bridge_compat
@@ -747,6 +815,10 @@ selection_from_tool_args = _selection.selection_from_tool_args
 QzoneComment = _social.QzoneComment
 QzonePost = _social.QzonePost
 post_from_entry = _social.post_from_entry
+
+
+def _post_contains_video_media(post: PostPayload) -> bool:
+    return any(is_video_media(item) for item in [*post.media, *post.attachments])
 
 
 def _clean_nickname_fallback(value: Any, *, hostuin: int = 0) -> str:
@@ -906,6 +978,8 @@ class QzoneStablePlugin(Star):
         self.data_dir = _standard_data_dir(self.root)
         self._onebot_client: Any | None = None
         self._cookie_lock: asyncio.Lock | None = None
+        self._video_upload_lock: asyncio.Lock | None = None
+        self._last_video_upload_probe: dict[str, Any] = {}
         self.controller = QzoneDaemonController(
             plugin_root=self.root,
             data_dir=self.data_dir,
@@ -1617,7 +1691,7 @@ class QzoneStablePlugin(Star):
         if not self.settings.send_admin:
             logger.debug("qzone admin post card notification skipped: send_admin disabled")
             return
-        bot = self._capture_onebot_client(event)
+        bot = self._capture_onebot_sender(event)
         if bot is None:
             logger.warning("qzone admin post card notification skipped: no OneBot client")
             return
@@ -1646,7 +1720,7 @@ class QzoneStablePlugin(Star):
         *,
         comment_text: str = "",
     ) -> None:
-        bot = self._capture_onebot_client(event)
+        bot = self._capture_onebot_sender(event)
         if bot is None:
             logger.warning("qzone event post card notification skipped: no OneBot client")
             return
@@ -1676,7 +1750,7 @@ class QzoneStablePlugin(Star):
         if not getattr(self.settings, "send_admin", False):
             logger.debug("qzone scheduled publish admin notification skipped: send_admin disabled")
             return
-        bot = self._capture_onebot_client(None)
+        bot = self._capture_onebot_sender(None)
         if bot is None:
             logger.warning("qzone scheduled publish admin notification skipped: no OneBot client")
             return
@@ -1755,18 +1829,117 @@ class QzoneStablePlugin(Star):
     async def _call_onebot_action(self, bot: Any, action: str, **kwargs: Any) -> None:
         method = getattr(bot, action, None)
         if callable(method):
-            await self._maybe_await(method(**kwargs))
+            await self._maybe_await(self._invoke_onebot_call_action(method, "", kwargs))
             return
-        call_action = getattr(bot, "call_action", None)
-        if callable(call_action):
-            await self._maybe_await(call_action(action, **kwargs))
-            return
-        api = getattr(bot, "api", None)
-        call_action = getattr(api, "call_action", None)
-        if callable(call_action):
-            await self._maybe_await(call_action(action, **kwargs))
-            return
+        last_type_error: TypeError | None = None
+        for call_action in self._iter_onebot_action_callers(bot):
+            try:
+                await self._maybe_await(self._invoke_onebot_call_action(call_action, action, kwargs))
+                return
+            except TypeError as exc:
+                last_type_error = exc
+                continue
+        if last_type_error is not None:
+            raise last_type_error
         raise AttributeError(f"OneBot client does not support {action}")
+
+    @staticmethod
+    def _iter_onebot_action_callers(bot: Any) -> list[Any]:
+        return list(iter_onebot_action_callers(bot))
+
+    async def _invoke_onebot_call_action(self, call_action: Any, action: str, kwargs: dict[str, Any]) -> Any:
+        attempts: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        if action:
+            envelope_kwargs = dict(kwargs)
+            attempts.extend(
+                [
+                    ((action,), dict(kwargs)),
+                    ((), {"action": action, **kwargs}),
+                    ((action, kwargs), {}),
+                    ((action,), {"params": kwargs}),
+                    ((), {"action": action, "params": kwargs}),
+                    (({"action": action, "params": envelope_kwargs},), {}),
+                    (({"action": action, "data": envelope_kwargs},), {}),
+                    (({"action": action, "payload": envelope_kwargs},), {}),
+                    (({"api": action, "params": envelope_kwargs},), {}),
+                    (({"api": action, "data": envelope_kwargs},), {}),
+                    ((action,), {"data": kwargs}),
+                    ((), {"action": action, "data": kwargs}),
+                    ((action,), {"payload": kwargs}),
+                    ((), {"action": action, "payload": kwargs}),
+                ]
+            )
+        else:
+            attempts.extend(
+                [
+                    ((), dict(kwargs)),
+                    ((kwargs,), {}),
+                    ((), {"params": kwargs}),
+                    ((), {"data": kwargs}),
+                    ((), {"payload": kwargs}),
+                ]
+            )
+        last_error: TypeError | None = None
+        for args, params in attempts:
+            try:
+                return await self._maybe_await(call_action(*args, **params))
+            except TypeError as exc:
+                last_error = exc
+                continue
+        if last_error is not None:
+            raise last_error
+        return await self._maybe_await(call_action(action, **kwargs) if action else call_action(**kwargs))
+
+    async def _query_onebot_action(self, bot: Any, action: str, **kwargs: Any) -> Any:
+        method = getattr(bot, action, None)
+        if callable(method):
+            return await self._maybe_await(self._invoke_onebot_call_action(method, "", kwargs))
+        last_type_error: TypeError | None = None
+        for call_action in self._iter_onebot_action_callers(bot):
+            try:
+                return await self._invoke_onebot_call_action(call_action, action, kwargs)
+            except TypeError as exc:
+                last_type_error = exc
+                continue
+        if last_type_error is not None:
+            raise last_type_error
+        raise AttributeError(f"OneBot client does not support {action}")
+
+    @staticmethod
+    def _onebot_identifier_param_variants(identifier: Any) -> list[dict[str, Any]]:
+        text = str(identifier or "").strip()
+        if not text:
+            return []
+        values: list[Any] = [identifier]
+        if text != identifier:
+            values.append(text)
+        if text.isdigit():
+            number = int(text)
+            values.append(number)
+        variants: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for key in ("message_id", "id"):
+            for value in values:
+                if value in (None, ""):
+                    continue
+                marker = (key, f"{type(value).__name__}:{value}")
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                variants.append({key: value})
+        return variants
+
+    async def _query_onebot_message(self, bot: Any, message_id: Any) -> Any:
+        last_error: Exception | None = None
+        for params in self._onebot_identifier_param_variants(message_id):
+            try:
+                return await self._query_onebot_action(bot, "get_msg", **params)
+            except Exception as exc:
+                last_error = exc
+                logger.debug("qzone OneBot get_msg failed params=%s: %s", params, exc)
+        if last_error is not None:
+            raise last_error
+        raise ValueError("empty message id")
 
     async def _send_admin_outgoing(self, bot: Any, outgoing: Any) -> int:
         sent = 0
@@ -2579,13 +2752,742 @@ class QzoneStablePlugin(Star):
         except ValueError:
             return 0, raw
 
-    def _collect_target_post_payload(self, event: AstrMessageEvent, content: str, prefixes: tuple[str, ...]) -> PostPayload:
-        return collect_post_payload(
+    @staticmethod
+    def _onebot_data_payload(payload: Any) -> Any:
+        if isinstance(payload, dict) and payload.get("data") not in (None, ""):
+            return payload["data"]
+        return payload
+
+    @staticmethod
+    def _onebot_segment_kind(segment: Any) -> str:
+        if isinstance(segment, dict):
+            raw = segment.get("type") or segment.get("kind") or ""
+        else:
+            raw = getattr(segment, "type", None) or getattr(segment, "kind", None) or segment.__class__.__name__
+        kind = str(raw or "").split(".")[-1].lower()
+        aliases = {
+            "plain": "text",
+            "picture": "image",
+            "voice": "record",
+            "audio": "record",
+        }
+        return aliases.get(kind, kind)
+
+    @staticmethod
+    def _onebot_segment_data(segment: Any) -> dict[str, Any]:
+        if isinstance(segment, dict):
+            merged = dict(segment)
+            data = segment.get("data")
+            if isinstance(data, dict):
+                merged.update(data)
+            return merged
+        data: dict[str, Any] = {}
+        raw_dict = getattr(segment, "__dict__", None)
+        if isinstance(raw_dict, dict):
+            data.update(raw_dict)
+        component_data = getattr(segment, "data", None)
+        if isinstance(component_data, dict):
+            data.update(component_data)
+        for attr in (
+            "text",
+            "content",
+            "message",
+            "file_",
+            "url",
+            "download_url",
+            "downloadUrl",
+            "file_url",
+            "fileUrl",
+            "media_url",
+            "mediaUrl",
+            "origin_url",
+            "originUrl",
+            "original_url",
+            "originalUrl",
+            "cdn_url",
+            "cdnUrl",
+            "preview_url",
+            "previewUrl",
+            "path",
+            "file_path",
+            "filePath",
+            "absolute_path",
+            "absolutePath",
+            "abs_path",
+            "absPath",
+            "local_path",
+            "localPath",
+            "source",
+            "src",
+            "name",
+            "filename",
+            "file_name",
+            "fileName",
+            "mime",
+            "mime_type",
+            "size",
+            "file_size",
+            "fileSize",
+            "file_id",
+            "fileId",
+            "file_unique",
+            "fileUnique",
+            "id",
+            "message_id",
+            "messageId",
+            "seq",
+            "chain",
+        ):
+            if attr not in data and hasattr(segment, attr):
+                with contextlib.suppress(Exception):
+                    data[attr] = getattr(segment, attr)
+        if "file" not in data and segment.__class__.__name__.lower() != "file" and hasattr(segment, "file"):
+            with contextlib.suppress(Exception):
+                data["file"] = getattr(segment, "file")
+        return data
+
+    @staticmethod
+    def _source_placeholder(value: Any) -> bool:
+        return str(value or "").strip().lower() in {"", "empty", "null", "none", "nil", "undefined", "false"}
+
+    @staticmethod
+    def _usable_media_source(value: Any) -> str:
+        if QzoneStablePlugin._source_placeholder(value):
+            return ""
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        if raw.startswith(("http://", "https://", "base64://", "data:", "file://")):
+            return normalize_source(raw) or raw
+        source = normalize_source(raw)
+        if not source:
+            return ""
+        if re.match(r"^[A-Za-z]:", source) or source.startswith(("/", "\\")):
+            return source
+        if "\\" in source or "/" in source:
+            return source
+        try:
+            if Path(source).is_file():
+                return source
+        except OSError:
+            return ""
+        return ""
+
+    @classmethod
+    def _onebot_local_source_exists(cls, source: str, data: dict[str, Any], kind: str) -> bool:
+        if source.startswith(("http://", "https://", "base64://", "data:")):
+            return True
+        name = cls._onebot_media_name(data, source)
+        is_video = cls._onebot_segment_is_video(kind, {**data, "source": source})
+        suffixes = QZONE_VIDEO_SUFFIXES if is_video else set()
+        if resolve_trusted_local_media_path(source, name=name, suffixes=suffixes) is not None:
+            return True
+        if is_video:
+            return resolve_trusted_local_media_path(source, name=name, suffixes=None) is not None
+        return False
+
+    @classmethod
+    def _onebot_source_from_data(
+        cls,
+        data: dict[str, Any],
+        *,
+        kind: str = "",
+        require_existing_local: bool = False,
+    ) -> str:
+        source_keys = MEDIA_URL_SOURCE_KEYS + MEDIA_LOCAL_SOURCE_KEYS + MEDIA_BASE64_SOURCE_KEYS
+        for key in source_keys:
+            source = cls._usable_media_source(data.get(key))
+            if source:
+                if require_existing_local and not cls._onebot_local_source_exists(source, data, kind):
+                    continue
+                return source
+        return base64_media_source(data)
+
+    @staticmethod
+    def _onebot_media_name(data: dict[str, Any], source: str = "") -> str:
+        for key in ("name", "filename", "file_name", "fileName", "file"):
+            value = str(data.get(key) or "").strip()
+            if value and not QzoneStablePlugin._source_placeholder(value):
+                return source_name(value) or value
+        return source_name(source)
+
+    @staticmethod
+    def _onebot_media_size(data: dict[str, Any]) -> int:
+        for key in ("size", "file_size", "fileSize"):
+            try:
+                size = int(data.get(key) or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if size > 0:
+                return size
+        return 0
+
+    @classmethod
+    def _onebot_post_media(
+        cls,
+        kind: str,
+        data: dict[str, Any],
+        source: str,
+        *,
+        require_existing_local: bool = False,
+    ) -> PostMedia | None:
+        source = cls._usable_media_source(source)
+        if not source:
+            return None
+        if require_existing_local and not cls._onebot_local_source_exists(source, data, kind):
+            return None
+        name = cls._onebot_media_name(data, source)
+        mime_type = str(data.get("mime_type") or data.get("mime") or guess_mime_type(name or source) or "")
+        media_kind = "video" if kind == "video" or is_video_media({"type": kind, **data, "source": source}) else kind
+        return PostMedia(
+            kind=media_kind,
+            source=source,
+            name=name,
+            mime_type=mime_type,
+            size=cls._onebot_media_size(data),
+            raw_type=kind,
+            trusted_local=True,
+        )
+
+    @classmethod
+    def _onebot_segment_is_video(cls, kind: str, data: dict[str, Any]) -> bool:
+        if kind == "video":
+            return True
+        name = cls._onebot_media_name(data, cls._onebot_source_from_data(data))
+        return is_video_media({"type": kind, **data, "name": name})
+
+    @staticmethod
+    def _onebot_identifier_stem(value: str) -> str:
+        text = str(value or "").strip()
+        if not text or text.startswith(("http://", "https://", "base64://", "data:", "file://")):
+            return ""
+        name = source_name(text) or text
+        suffix = Path(name).suffix.lower()
+        if suffix not in QZONE_VIDEO_SUFFIXES:
+            return ""
+        stem = Path(name).stem.strip()
+        return stem if stem and stem != text else ""
+
+    @classmethod
+    def _onebot_media_identifier_candidates(cls, data: dict[str, Any], *, kind: str = "") -> list[str]:
+        candidates: list[str] = []
+        for key in (
+            "file_id",
+            "fileId",
+            "file",
+            "file_",
+            "file_unique",
+            "fileUnique",
+            "file_uuid",
+            "fileUuid",
+            "fid",
+            "id",
+            "attachment_id",
+            "attachmentId",
+            "md5",
+            "sha",
+            "sha1",
+        ):
+            value = data.get(key)
+            if cls._source_placeholder(value):
+                continue
+            text = str(value or "").strip()
+            if text and text not in candidates:
+                candidates.append(text)
+        if kind == "video" or cls._onebot_segment_is_video(kind, data):
+            for value in list(candidates):
+                stem = cls._onebot_identifier_stem(value)
+                if stem and stem not in candidates:
+                    candidates.append(stem)
+        return candidates
+
+    @staticmethod
+    def _dedupe_onebot_action_calls(calls: Iterable[tuple[str, dict[str, Any]]]) -> list[tuple[str, dict[str, Any]]]:
+        result: list[tuple[str, dict[str, Any]]] = []
+        seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+        for action, params in calls:
+            key = (action, tuple(sorted((item_key, str(item_value)) for item_key, item_value in params.items())))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append((action, params))
+        return result
+
+    @classmethod
+    def _onebot_video_file_action_calls(cls, data: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+        calls: list[tuple[str, dict[str, Any]]] = []
+        identifiers = cls._onebot_media_identifier_candidates(data, kind="video")
+        direct_file_keys = {"file", "file_", "attachment_id", "attachmentId"}
+        direct_id_keys = {
+            "file_id",
+            "fileId",
+            "file_unique",
+            "fileUnique",
+            "file_uuid",
+            "fileUuid",
+            "fid",
+            "id",
+            "md5",
+            "sha",
+            "sha1",
+        }
+        direct_files: set[str] = set()
+        direct_ids: set[str] = set()
+        for key in direct_file_keys:
+            value = data.get(key)
+            if not cls._source_placeholder(value):
+                text = str(value or "").strip()
+                if text:
+                    direct_files.add(text)
+                    stem = cls._onebot_identifier_stem(text)
+                    if stem:
+                        direct_files.add(stem)
+        for key in direct_id_keys:
+            value = data.get(key)
+            if not cls._source_placeholder(value):
+                text = str(value or "").strip()
+                if text:
+                    direct_ids.add(text)
+                    stem = cls._onebot_identifier_stem(text)
+                    if stem:
+                        direct_ids.add(stem)
+        for value in identifiers:
+            param_variants: list[dict[str, Any]] = []
+            if value in direct_ids:
+                param_variants.extend(
+                    [
+                        {"file_id": value},
+                        {"type": "path", "file_id": value},
+                        {"type": "url", "file_id": value},
+                        {"type": "base64", "file_id": value},
+                        {"id": value},
+                    ]
+                )
+            if value in direct_files or value not in direct_ids:
+                param_variants.extend(
+                    [
+                        {"file": value},
+                        {"type": "path", "file": value},
+                        {"type": "url", "file": value},
+                        {"type": "base64", "file": value},
+                    ]
+                )
+            param_variants.extend([{"video": value}, {"id": value}])
+            for params in param_variants:
+                calls.append(("get_file", params))
+            for params in param_variants:
+                calls.append(("get_video", params))
+        return cls._dedupe_onebot_action_calls(calls)
+
+    def _onebot_file_url_action_calls(
+        self,
+        data: dict[str, Any],
+        event: AstrMessageEvent | None,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        identifiers = self._onebot_media_identifier_candidates(data, kind="video")
+        if not identifiers:
+            return []
+        calls: list[tuple[str, dict[str, Any]]] = []
+        group_id = self._group_id(event) if event is not None else 0
+        busid = data.get("busid") or data.get("bus_id") or data.get("busId")
+        for file_id in identifiers:
+            group_params: list[dict[str, Any]] = []
+            for key in ("file_id", "file", "id"):
+                base = {key: file_id}
+                if not self._source_placeholder(busid):
+                    with_busid = {**base, "busid": busid}
+                    group_params.append(with_busid)
+                group_params.append(base)
+            if group_id:
+                for params in group_params:
+                    calls.append(("get_group_file_url", {"group_id": group_id, **params}))
+                    calls.append(("get_group_file_url", {"group": group_id, **params}))
+            for key in ("file_id", "file", "id"):
+                calls.append(("get_private_file_url", {key: file_id}))
+                calls.append(("get_file_url", {key: file_id}))
+                calls.append(("get_video_url", {key: file_id}))
+        return self._dedupe_onebot_action_calls(calls)
+
+    def _iter_onebot_segments(self, payload: Any, *, seen: set[int] | None = None, depth: int = 0) -> list[Any]:
+        if depth > 6 or payload in (None, "", [], (), {}):
+            return []
+        if seen is None:
+            seen = set()
+        if not isinstance(payload, (str, bytes, bytearray, int, float, bool)):
+            marker = id(payload)
+            if marker in seen:
+                return []
+            seen.add(marker)
+
+        if isinstance(payload, str):
+            return parse_cq_message(payload)
+        if isinstance(payload, (list, tuple, set)):
+            segments: list[Any] = []
+            for item in payload:
+                segments.extend(self._iter_onebot_segments(item, seen=seen, depth=depth + 1))
+            return segments
+        segments = []
+        if isinstance(payload, dict):
+            kind = payload.get("type") or payload.get("kind")
+            if kind:
+                segments.append(payload)
+            data = payload.get("data")
+            owners = [payload]
+            if isinstance(data, dict):
+                owners.append(data)
+            for owner in owners:
+                for key in (
+                    "message",
+                    "messages",
+                    "message_chain",
+                    "raw_message",
+                    "raw_messages",
+                    "message_segments",
+                    "media",
+                    "medias",
+                    "attachment",
+                    "attachments",
+                    "files",
+                ):
+                    if key in owner:
+                        segments.extend(self._iter_onebot_segments(owner.get(key), seen=seen, depth=depth + 1))
+            return segments
+
+        kind = self._onebot_segment_kind(payload)
+        if kind:
+            segments.append(payload)
+        for key in ("message", "messages", "chain", "message_chain", "raw_message"):
+            if hasattr(payload, key):
+                try:
+                    nested = getattr(payload, key)
+                except Exception:
+                    continue
+                segments.extend(self._iter_onebot_segments(nested, seen=seen, depth=depth + 1))
+        return segments
+
+    def _dedupe_media(self, items: Iterable[PostMedia]) -> list[PostMedia]:
+        result: list[PostMedia] = []
+        seen: set[tuple[str, str]] = set()
+        for item in items:
+            key = (item.kind, item.source)
+            if not item.source or key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+        return result
+
+    async def _onebot_get_file_media(
+        self,
+        bot: Any,
+        kind: str,
+        data: dict[str, Any],
+    ) -> PostMedia | None:
+        for action, params in self._onebot_video_file_action_calls(data):
+            try:
+                payload = await self._query_onebot_action(bot, action, **params)
+            except Exception as exc:
+                logger.debug("qzone OneBot %s failed params=%s: %s", action, params, exc)
+                continue
+            result = self._onebot_data_payload(payload)
+            if isinstance(result, dict):
+                merged = {**data, **result}
+                source = self._onebot_source_from_data(merged, kind=kind, require_existing_local=True)
+                media = self._onebot_post_media(kind, merged, source, require_existing_local=True)
+                if media is not None:
+                    return media
+            elif isinstance(result, str):
+                source = self._usable_media_source(result)
+                if source:
+                    source_key = "url" if source.startswith(("http://", "https://", "base64://", "data:")) else "file"
+                    merged = {**data, source_key: source}
+                    media = self._onebot_post_media(kind, merged, source, require_existing_local=True)
+                    if media is not None:
+                        return media
+        return None
+
+    async def _onebot_file_url_media(
+        self,
+        bot: Any,
+        kind: str,
+        data: dict[str, Any],
+        event: AstrMessageEvent | None,
+    ) -> PostMedia | None:
+        for action, params in self._onebot_file_url_action_calls(data, event):
+            try:
+                payload = await self._query_onebot_action(bot, action, **params)
+            except Exception as exc:
+                logger.debug("qzone OneBot %s failed params=%s: %s", action, params, exc)
+                continue
+            result = self._onebot_data_payload(payload)
+            if isinstance(result, dict):
+                merged = {**data, **result}
+                source = self._onebot_source_from_data(merged, kind=kind, require_existing_local=True)
+                media = self._onebot_post_media(kind, merged, source, require_existing_local=True)
+                if media is not None:
+                    return media
+            elif isinstance(result, str):
+                source = self._usable_media_source(result)
+                if source:
+                    source_key = "url" if source.startswith(("http://", "https://", "base64://", "data:")) else "file"
+                    merged = {**data, source_key: source}
+                    media = self._onebot_post_media(kind, merged, source, require_existing_local=True)
+                    if media is not None:
+                        return media
+        return None
+
+    async def _resolve_onebot_segment_media(
+        self,
+        bot: Any,
+        segment: Any,
+        *,
+        event: AstrMessageEvent | None,
+    ) -> PostMedia | None:
+        kind = self._onebot_segment_kind(segment)
+        if kind not in {"image", "video", "file", "record"}:
+            return None
+        data = self._onebot_segment_data(segment)
+        if kind == "file" and not self._onebot_segment_is_video(kind, data):
+            return None
+        source = self._onebot_source_from_data(data, kind=kind, require_existing_local=True)
+        media = self._onebot_post_media(kind, data, source, require_existing_local=True) if source else None
+        if media is not None:
+            return media
+        if kind in {"video", "file"}:
+            media = await self._onebot_get_file_media(bot, "video", data)
+            if media is not None:
+                return media
+            return await self._onebot_file_url_media(bot, "video", data, event)
+        return None
+
+    async def _onebot_payload_media(
+        self,
+        bot: Any,
+        payload: Any,
+        *,
+        event: AstrMessageEvent | None,
+    ) -> list[PostMedia]:
+        media: list[PostMedia] = []
+        for segment in self._iter_onebot_segments(payload):
+            item = await self._resolve_onebot_segment_media(bot, segment, event=event)
+            if item is not None:
+                media.append(item)
+        return self._dedupe_media(media)
+
+    async def _component_file_media(
+        self,
+        component: Any,
+        kind: str,
+        *,
+        bot: Any | None = None,
+        event: AstrMessageEvent | None = None,
+    ) -> PostMedia | None:
+        data = self._onebot_segment_data(component)
+        source = self._onebot_source_from_data(data, kind=kind, require_existing_local=True)
+        if source:
+            return self._onebot_post_media(kind, data, source, require_existing_local=True)
+        method_name = "get_file" if kind == "file" else "convert_to_file_path"
+        method = getattr(component, method_name, None)
+        if kind == "file" and not self._onebot_segment_is_video(kind, data):
+            return None
+        media_kind = "video" if kind == "file" and self._onebot_segment_is_video(kind, data) else kind
+        if callable(method):
+            try:
+                resolved = await self._maybe_await(method())
+            except Exception as exc:
+                logger.debug("qzone component media materialize failed kind=%s: %s", kind, exc)
+            else:
+                media = self._onebot_post_media(media_kind, data, str(resolved or ""), require_existing_local=True)
+                if media is not None:
+                    return media
+        if bot is not None and media_kind == "video":
+            media = await self._onebot_get_file_media(bot, "video", data)
+            if media is not None:
+                return media
+            return await self._onebot_file_url_media(bot, "video", data, event)
+        return None
+
+    async def _component_runtime_media(
+        self,
+        component: Any,
+        *,
+        seen: set[int],
+        bot: Any | None = None,
+        event: AstrMessageEvent | None = None,
+        depth: int = 0,
+    ) -> list[PostMedia]:
+        if depth > 6 or component in (None, "", [], (), {}):
+            return []
+        if not isinstance(component, (str, bytes, bytearray, int, float, bool)):
+            marker = id(component)
+            if marker in seen:
+                return []
+            seen.add(marker)
+        if isinstance(component, (list, tuple, set)):
+            media: list[PostMedia] = []
+            for item in component:
+                media.extend(
+                    await self._component_runtime_media(
+                        item,
+                        seen=seen,
+                        bot=bot,
+                        event=event,
+                        depth=depth + 1,
+                    )
+                )
+            return media
+        if isinstance(component, str):
+            return []
+
+        kind = self._onebot_segment_kind(component)
+        media: list[PostMedia] = []
+        if kind in {"image", "video", "record", "file"}:
+            item = await self._component_file_media(component, kind, bot=bot, event=event)
+            if item is not None:
+                media.append(item)
+        data = self._onebot_segment_data(component)
+        for key in ("chain", "message", "messages", "message_chain", "reply", "quoted", "quoted_message"):
+            nested = data.get(key)
+            if nested in (None, "", [], (), {}):
+                continue
+            media.extend(
+                await self._component_runtime_media(
+                    nested,
+                    seen=seen,
+                    bot=bot,
+                    event=event,
+                    depth=depth + 1,
+                )
+            )
+        result = self._dedupe_media(media)
+        if kind in {"reply", "quote", "quoted", "reference"}:
+            return collapse_single_video_cover_companion_media(result)
+        return result
+
+    async def _event_runtime_media(self, event: AstrMessageEvent) -> list[PostMedia]:
+        media: list[PostMedia] = []
+        seen: set[int] = set()
+        bot = self._capture_onebot_client(event)
+        for component in iter_event_components(event):
+            media.extend(await self._component_runtime_media(component, seen=seen, bot=bot, event=event))
+        if bot is not None:
+            message_obj = getattr(event, "message_obj", None)
+            for payload in (
+                getattr(message_obj, "raw_message", None),
+                getattr(event, "raw_message", None),
+            ):
+                media.extend(await self._onebot_payload_media(bot, payload, event=event))
+        return self._dedupe_media(media)
+
+    async def _referenced_message_media(self, event: AstrMessageEvent) -> list[PostMedia]:
+        message_ids = iter_reference_message_ids(event)
+        if not message_ids:
+            return []
+        bot = self._capture_onebot_client(event)
+        if bot is None:
+            return []
+        media: list[PostMedia] = []
+        for message_id in message_ids:
+            try:
+                payload = await self._query_onebot_message(bot, message_id)
+            except Exception as exc:
+                logger.debug("qzone referenced message lookup failed message_id=%s: %s", message_id, exc)
+                continue
+            data_payload = self._onebot_data_payload(payload)
+            message_media: list[PostMedia] = []
+            message_media.extend(await self._onebot_payload_media(bot, data_payload, event=event))
+            message_media.extend(collect_message_media(data_payload))
+            media.extend(collapse_single_video_cover_companion_media(self._dedupe_media(message_media)))
+        return self._dedupe_media(media)
+
+    async def _collect_target_post_payload(
+        self,
+        event: AstrMessageEvent,
+        content: str,
+        prefixes: tuple[str, ...],
+        *,
+        include_event_text: bool = True,
+        extra_media: Iterable[Any] | None = None,
+    ) -> PostPayload:
+        runtime_media = await self._event_runtime_media(event)
+        referenced_media = await self._referenced_message_media(event)
+        combined_extra_media: list[Any] = [*runtime_media, *referenced_media]
+        if extra_media is not None:
+            combined_extra_media.extend(extra_media)
+        post = collect_post_payload(
             event,
             fallback_content=content,
-            include_event_text=True,
+            include_event_text=include_event_text,
             command_prefixes=prefixes,
+            extra_media=combined_extra_media,
         )
+        if not post.content.strip() and not post.media and not post.attachments:
+            message_ids = iter_reference_message_ids(event)
+            if message_ids:
+                component_kinds = [self._onebot_segment_kind(item) for item in iter_event_components(event)[:8]]
+                logger.warning(
+                    "qzone publish payload empty after referenced message lookup reference_ids=%s onebot_client=%s components=%s",
+                    [str(item) for item in message_ids],
+                    bool(self._capture_onebot_client(event)),
+                    component_kinds,
+                )
+        return post
+
+    async def _prepare_video_sources(self, post: PostPayload) -> PostPayload:
+        return await asyncio.to_thread(
+            materialize_video_sources,
+            post,
+            self.data_dir / "video_sources",
+        )
+
+    async def _prepare_publish_payload(self, post: PostPayload) -> PostPayload:
+        return await asyncio.to_thread(
+            materialize_video_covers,
+            post,
+            self.data_dir / "video_covers",
+        )
+
+    async def _publish_daemon_video_post(
+        self,
+        post: PostPayload,
+        *,
+        sync_weibo: bool,
+    ) -> dict[str, Any]:
+        return await self.controller.publish_post(
+            content=post.content,
+            sync_weibo=sync_weibo,
+            media=[item.to_dict() for item in [*post.media, *post.attachments]],
+            content_sanitized=True,
+        )
+
+    async def _publish_post_payload(
+        self,
+        post: PostPayload,
+        *,
+        sync_weibo: bool = False,
+        event: AstrMessageEvent | None = None,
+    ) -> tuple[PostPayload, dict[str, Any]]:
+        post = await self._prepare_video_sources(post)
+        render_post: PostPayload | None = None
+        if _post_contains_video_media(post):
+            if not getattr(self.settings, "native_video_publish", True):
+                raise QzoneParseError(
+                    "Video attachment detected but native_video_publish is disabled; refusing to publish a cover image as success. "
+                    "Enable native_video_publish and run /qzone autobind to bind Qzone Web Cookie/p_skey for the H5 "
+                    "private-create + permission-update + public-verification chain."
+                )
+            render_post = await self._prepare_publish_payload(post)
+            payload = await self._publish_daemon_video_post(post, sync_weibo=sync_weibo)
+            return render_post, payload
+
+        if render_post is None:
+            render_post = await self._prepare_publish_payload(post)
+        payload = await self.controller.publish_post(
+            content=render_post.content,
+            sync_weibo=sync_weibo,
+            media=[item.to_dict() for item in render_post.media],
+            content_sanitized=True,
+        )
+        return render_post, payload
 
     async def _create_draft(self, event: AstrMessageEvent, post: PostPayload, *, anonymous: bool = False) -> DraftPost:
         return await self.drafts.add_async(
@@ -2598,7 +3500,7 @@ class QzoneStablePlugin(Star):
         )
 
     async def _notify_review_target(self, event: AstrMessageEvent, draft: DraftPost, message: str) -> None:
-        bot = self._capture_onebot_client(event)
+        bot = self._capture_onebot_sender(event)
         if bot is None:
             return
         text = f"{message}\n{draft.preview(include_private=True)}"
@@ -2622,7 +3524,7 @@ class QzoneStablePlugin(Star):
             logger.debug("qzone draft review notification failed: %s", exc)
 
     async def _notify_draft_author(self, event: AstrMessageEvent, draft: DraftPost, message: str) -> None:
-        bot = self._capture_onebot_client(event)
+        bot = self._capture_onebot_sender(event)
         if bot is None or not draft.author_uin:
             return
         try:
@@ -3329,46 +4231,296 @@ class QzoneStablePlugin(Star):
             self._cookie_lock = asyncio.Lock()
         return self._cookie_lock
 
+    def _get_video_upload_lock(self) -> asyncio.Lock:
+        if getattr(self, "_video_upload_lock", None) is None:
+            self._video_upload_lock = asyncio.Lock()
+        return self._video_upload_lock
+
+    @staticmethod
+    def _looks_like_onebot_client(candidate: Any) -> bool:
+        if candidate is None:
+            return False
+        for action in (
+            *COOKIE_ACTIONS,
+            *ONEBOT_ACTION_CALLER_ATTRS,
+            "get_msg",
+            "get_file",
+            "get_record",
+            "get_image",
+            "get_group_file_url",
+            "get_private_file_url",
+            "get_file_url",
+            "get_video_url",
+            "get_stranger_info",
+            "get_group_member_info",
+        ):
+            if callable(getattr(candidate, action, None)):
+                return True
+        return False
+
+    @staticmethod
+    def _looks_like_onebot_sender(candidate: Any) -> bool:
+        if candidate is None:
+            return False
+        return any(
+            callable(getattr(candidate, action, None))
+            for action in ("send_group_msg", "send_private_msg", "send_msg")
+        )
+
+    @classmethod
+    def _extract_onebot_client(cls, owner: Any) -> Any | None:
+        """Find a usable OneBot/Aiocqhttp action client without caching wrappers.
+
+        AstrBot adapters expose several wrapper shapes. Some events have a
+        ``bot`` attribute that is only a wrapper; returning it blindly makes
+        ``/qzone autobind`` call get_cookies on the wrong object. Only return
+        objects that really expose OneBot action dispatchers, while walking the
+        common nested adapter/API fields used by aiocqhttp, NapCat, LLOneBot,
+        Lagrange, and AstrBot platform managers.
+        """
+
+        queue: list[Any] = [owner] if owner is not None else []
+        seen: set[int] = set()
+        owner_attrs = tuple(dict.fromkeys((*ONEBOT_ACTION_OWNER_ATTRS, "protocol_client", "driver", "impl")))
+        getter_names = ("get_client", "get_bot", "get_adapter", "get_platform")
+
+        index = 0
+        while index < len(queue) and index < 64:
+            current = queue[index]
+            index += 1
+            if current is None:
+                continue
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+
+            if cls._looks_like_onebot_client(current):
+                return current
+
+            for getter_name in getter_names:
+                try:
+                    getter = getattr(current, getter_name, None)
+                except Exception:
+                    getter = None
+                if not callable(getter):
+                    continue
+                try:
+                    candidate = getter()
+                except Exception:
+                    continue
+                if candidate is not None and id(candidate) not in seen:
+                    queue.append(candidate)
+
+            for attr in owner_attrs:
+                try:
+                    candidate = getattr(current, attr, None)
+                except Exception:
+                    continue
+                if candidate is not None and id(candidate) not in seen:
+                    queue.append(candidate)
+        return None
+
+    @classmethod
+    def _extract_onebot_sender(cls, owner: Any) -> Any | None:
+        queue: list[Any] = [owner] if owner is not None else []
+        seen: set[int] = set()
+        owner_attrs = tuple(dict.fromkeys((*ONEBOT_ACTION_OWNER_ATTRS, "protocol_client", "driver", "impl")))
+        index = 0
+        while index < len(queue) and index < 64:
+            current = queue[index]
+            index += 1
+            if current is None:
+                continue
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            if cls._looks_like_onebot_sender(current) or cls._looks_like_onebot_client(current):
+                return current
+            for attr in owner_attrs:
+                try:
+                    candidate = getattr(current, attr, None)
+                except Exception:
+                    continue
+                if candidate is not None and id(candidate) not in seen:
+                    queue.append(candidate)
+        return None
+
+    @staticmethod
+    def _onebot_platform_meta_matches(candidate: Any) -> bool:
+        try:
+            meta_attr = getattr(candidate, "meta", None)
+            meta = meta_attr() if callable(meta_attr) else meta_attr
+        except Exception:
+            meta = None
+        values = [
+            getattr(candidate, "name", ""),
+            getattr(candidate, "type", ""),
+            getattr(candidate, "platform_type", ""),
+            getattr(candidate, "platform_name", ""),
+            getattr(meta, "name", ""),
+            getattr(meta, "type", ""),
+        ]
+        for value in values:
+            text = str(value or "").lower()
+            if (
+                text == "aiocqhttp"
+                or "onebot" in text
+                or "cqhttp" in text
+                or "napcat" in text
+                or "llbot" in text
+                or "llonebot" in text
+                or "lagrange" in text
+                or "shamrock" in text
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _iter_context_platform_candidates(cls, context: Any) -> list[Any]:
+        if context is None:
+            return []
+        candidates: list[Any] = []
+        seen: set[int] = set()
+
+        def add(value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, dict):
+                for item in value.values():
+                    add(item)
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    add(item)
+                return
+            value_id = id(value)
+            if value_id in seen:
+                return
+            seen.add(value_id)
+            candidates.append(value)
+
+        add(context)
+
+        try:
+            get_platform = getattr(context, "get_platform", None)
+        except Exception:
+            get_platform = None
+        if callable(get_platform):
+            for platform_type in (
+                "aiocqhttp",
+                "onebot",
+                "onebot11",
+                "onebot_v11",
+                "onebot_v12",
+                "go-cqhttp",
+                "gocqhttp",
+                "napcat",
+                "llbot",
+                "llonebot",
+                "lagrange",
+                "shamrock",
+            ):
+                try:
+                    add(get_platform(platform_type))
+                except Exception:
+                    pass
+
+        for attr in ("platform", "adapter", "bot"):
+            try:
+                add(getattr(context, attr, None))
+            except Exception:
+                pass
+
+        try:
+            platform_manager = getattr(context, "platform_manager", None)
+        except Exception:
+            platform_manager = None
+        if platform_manager is not None:
+            for attr in ("platform_insts", "platforms", "adapters", "instances"):
+                try:
+                    add(getattr(platform_manager, attr, None))
+                except Exception:
+                    pass
+            for getter_name in ("get_platforms", "get_all_platforms", "list_platforms"):
+                try:
+                    getter = getattr(platform_manager, getter_name, None)
+                except Exception:
+                    getter = None
+                if callable(getter):
+                    try:
+                        add(getter())
+                    except Exception:
+                        pass
+        return candidates
+
     def _capture_onebot_client_from_context(self) -> Any | None:
         context = getattr(self, "_context", None) or getattr(self, "context", None)
-        platform = None
-        if context is not None:
-            try:
-                platform = context.get_platform("aiocqhttp")
-            except Exception:
-                platform = None
-            if platform is None:
-                try:
-                    platform_manager = getattr(context, "platform_manager", None)
-                    for candidate in getattr(platform_manager, "platform_insts", []):
-                        meta = candidate.meta()
-                        if getattr(meta, "name", "") == "aiocqhttp":
-                            platform = candidate
-                            break
-                except Exception:
-                    platform = None
-        if platform is not None:
-            bot = getattr(platform, "bot", None)
+        for candidate in self._iter_context_platform_candidates(context):
+            bot = self._extract_onebot_client(candidate)
             if bot is not None:
                 self._onebot_client = bot
-        return self._onebot_client
+                return bot
+            if self._onebot_platform_meta_matches(candidate):
+                logger.debug("qzone found OneBot-like AstrBot platform but no action client on it")
+        return getattr(self, "_onebot_client", None)
 
     def _capture_onebot_client(self, event: AstrMessageEvent | None = None) -> Any | None:
-        bot = getattr(event, "bot", None) if event is not None else None
-        if bot is not None:
-            self._onebot_client = bot
-            return bot
+        if event is not None:
+            message_obj = getattr(event, "message_obj", None)
+            for owner in (
+                event,
+                message_obj,
+                getattr(event, "platform", None),
+                getattr(event, "platform_meta", None),
+                getattr(event, "adapter", None),
+            ):
+                bot = self._extract_onebot_client(owner)
+                if bot is not None:
+                    self._onebot_client = bot
+                    return bot
+        return self._capture_onebot_client_from_context()
+
+    def _capture_onebot_sender(self, event: AstrMessageEvent | None = None) -> Any | None:
+        if event is not None:
+            message_obj = getattr(event, "message_obj", None)
+            for owner in (
+                event,
+                message_obj,
+                getattr(event, "bot", None),
+                getattr(event, "platform", None),
+                getattr(event, "adapter", None),
+            ):
+                bot = self._extract_onebot_sender(owner)
+                if bot is not None:
+                    return bot
         return self._capture_onebot_client_from_context()
 
     def _cookie_binding_hint(self) -> str:
-        return "没有从 AstrBot 拿到 aiocqhttp(OneBot v11) 客户端，请先用 /qzone bind 手动绑定 Cookie。"
+        client = getattr(self, "_onebot_client", None)
+        if client is not None:
+            callers = iter_onebot_action_callers(client)
+            if callers:
+                return (
+                    "OneBot/Aiocqhttp action client was detected, but it did not return a usable Qzone Cookie; "
+                    "please confirm get_cookies/get_credentials is supported and the bot is logged in, or bind with /qzone bind."
+                )
+            return (
+                "The detected OneBot/Aiocqhttp object does not expose a callable action API; "
+                "please confirm the AstrBot aiocqhttp/NapCat/LLOneBot adapter is online, or bind with /qzone bind."
+            )
+        return (
+            "No usable OneBot/Aiocqhttp action client was found from AstrBot; "
+            "please confirm the protocol endpoint is connected, or bind with /qzone bind."
+        )
 
     async def _auto_bind_cookie(
         self,
         event: AstrMessageEvent | None = None,
         *,
         force: bool = False,
-        source: str = "aiocqhttp",
+        source: str = "onebot",
     ) -> dict[str, Any]:
         async with self._get_cookie_lock():
             if not self.settings.auto_bind_cookie and not force:
@@ -3424,7 +4576,7 @@ class QzoneStablePlugin(Star):
         event: AstrMessageEvent | None = None,
         *,
         force: bool = False,
-        source: str = "aiocqhttp",
+        source: str = "onebot",
     ) -> dict[str, Any] | None:
         try:
             status = await self.controller.get_status(probe_daemon=False)
@@ -3436,6 +4588,30 @@ class QzoneStablePlugin(Star):
         payload = await self._auto_bind_cookie(event, force=force, source=source)
         self._schedule_publish_render_asset_preload("cookie bind", event=event, status=payload)
         return payload
+
+    async def _ensure_cookie_ready_for_video_auth(self, event: AstrMessageEvent | None = None) -> dict[str, Any] | None:
+        """Ensure Web Cookie/p_skey is available for status diagnostics."""
+
+        try:
+            status = await self.controller.get_status(probe_daemon=False)
+        except QzoneBridgeError:
+            status = {}
+        if status and int(status.get("cookie_count") or 0) > 0 and not bool(status.get("needs_rebind")):
+            self._schedule_publish_render_asset_preload("video auth cookie ready", event=event, status=status)
+            return status
+        return await self._ensure_cookie_ready(event, force=True, source="onebot")
+
+    @staticmethod
+    def _status_has_video_publish_ready(status: dict[str, Any] | None) -> bool:
+        if not isinstance(status, dict):
+            return False
+        video_upload = status.get("video_upload")
+        if not isinstance(video_upload, dict):
+            return False
+        return bool(
+            video_upload.get("h5_publish_supported")
+            and (video_upload.get("web_cookie_configured") or video_upload.get("h5_upload_available"))
+        )
 
     async def _call_bootstrap_auto_bind(
         self,
@@ -3467,7 +4643,7 @@ class QzoneStablePlugin(Star):
             await self._prewarm_daemon_if_cookie_ready(trigger)
             return True
         try:
-            await self._ensure_cookie_ready(event, force=force_refresh, source="aiocqhttp")
+            await self._ensure_cookie_ready(event, force=force_refresh, source="onebot")
         except QzoneBridgeError as exc:
             logger.warning("qzone auto bind on %s failed: %s", trigger, exc)
             return False
@@ -3798,16 +4974,12 @@ class QzoneStablePlugin(Star):
     async def publish_feed(self, event: AstrMessageEvent, content: str = ""):
         """发布一条 QQ 空间说说，支持文字和图片。"""
         self._stop_event(event)
-        post = self._collect_target_post_payload(event, content, ("发说说",))
+        post = await self._collect_target_post_payload(event, content, ("发说说",))
         profile_task: asyncio.Task | None = None
         try:
             await self._ensure_cookie_ready(event)
             profile_task = self._schedule_publisher_profile(event)
-            payload = await self.controller.publish_post(
-                content=post.content,
-                media=[item.to_dict() for item in post.media],
-                content_sanitized=True,
-            )
+            post, payload = await self._publish_post_payload(post, event=event)
             if payload.get("fid"):
                 await self._post_store().upsert_async(
                     QzonePost(
@@ -3830,7 +5002,7 @@ class QzoneStablePlugin(Star):
     async def write_feed(self, event: AstrMessageEvent):
         """根据主题生成说说草稿，提交管理员审核。"""
         topic = self._message_after_command(self._event_text(event), ("写说说", "写稿"))
-        post = self._collect_target_post_payload(event, topic, ("写说说", "写稿"))
+        post = await self._collect_target_post_payload(event, topic, ("写说说", "写稿"))
         try:
             text = await self._generate_post_text(event, post.content)
         except Exception as exc:
@@ -4104,7 +5276,7 @@ class QzoneStablePlugin(Star):
     @filter.command("投稿")
     async def contribute_post(self, event: AstrMessageEvent, content: str = ""):
         """提交一条待审核的说说投稿。"""
-        post = self._collect_target_post_payload(event, content, ("投稿",))
+        post = await self._collect_target_post_payload(event, content, ("投稿",))
         if not post.content.strip() and not post.media:
             yield self._command_result(event, "投稿内容或图片不能为空。")
             return
@@ -4115,7 +5287,7 @@ class QzoneStablePlugin(Star):
     @filter.command("匿名投稿")
     async def anon_contribute_post(self, event: AstrMessageEvent, content: str = ""):
         """匿名提交一条待审核的说说投稿。"""
-        post = self._collect_target_post_payload(event, content, ("匿名投稿",))
+        post = await self._collect_target_post_payload(event, content, ("匿名投稿",))
         if not post.content.strip() and not post.media:
             yield self._command_result(event, "投稿内容或图片不能为空。")
             return
@@ -4216,11 +5388,7 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             profile_task = self._schedule_publisher_profile(event)
-            payload = await self.controller.publish_post(
-                content=post.content,
-                media=[item.to_dict() for item in post.media],
-                content_sanitized=True,
-            )
+            post, payload = await self._publish_post_payload(post, event=event)
             published_fid = str(payload.get("fid") or "")
 
             def mark_published(current: DraftPost) -> None:
@@ -4322,6 +5490,7 @@ class QzoneStablePlugin(Star):
                 "/qzone status",
                 "/qzone bind <cookie>",
                 "/qzone autobind",
+                "/qzone autovideoauth",
                 "/qzone unbind",
                 "",
                 "LLM tools:",
@@ -4379,7 +5548,7 @@ class QzoneStablePlugin(Star):
             yield self._command_result(event, "只有管理员可以自动绑定 Cookie。")
             return
         try:
-            payload = await self._auto_bind_cookie(event, force=True, source="aiocqhttp")
+            payload = await self._auto_bind_cookie(event, force=True, source="onebot")
         except QzoneBridgeError as exc:
             logger.warning("qzone autobind failed: %s", exc)
             yield self._command_result(event, self._error_text(exc))
@@ -4390,6 +5559,42 @@ class QzoneStablePlugin(Star):
             payload = await self._status_with_recovery()
         except QzoneBridgeError:
             pass
+        yield self._command_result(event, format_status(payload))
+
+    @qzone.command("videoauth")
+    async def qzone_videoauth(
+        self,
+        event: AstrMessageEvent,
+        login_data_b64: str = "",
+        login_key_b64: str = "",
+        token_type: int = 2,
+        token_appid: int = 0,
+        token_wt_appid: int = 0,
+    ):
+        """Deprecated compatibility command; A2/vLoginData is not used as a fallback."""
+        if not self._is_admin(event):
+            yield self._command_result(event, "Only admins can refresh video publish authorization.")
+            return
+        yield self._command_result(
+            event,
+            "Video publishing is fixed to the H5 chain: upload video/cover, create an only-self-visible video mood, "
+            "call the permission update API to make it public, then verify public feed/detail. "
+            "QQ upload A2/vLoginData fallback is disabled. Use /qzone autovideoauth to refresh Qzone Web Cookie/p_skey.",
+        )
+
+    @qzone.command("autovideoauth")
+    async def qzone_autovideoauth(self, event: AstrMessageEvent, probe_mode: str = ""):
+        """Ensure H5 video publish readiness through Qzone Web Cookie/p_skey."""
+        if not self._is_admin(event):
+            yield self._command_result(event, "Only admins can refresh video publish authorization.")
+            return
+        try:
+            await self._ensure_cookie_ready_for_video_auth(event)
+            payload = await self._status_with_recovery()
+        except QzoneBridgeError as exc:
+            logger.warning("qzone autovideoauth failed: %s", exc)
+            yield self._command_result(event, self._error_text(exc))
+            return
         yield self._command_result(event, format_status(payload))
 
     @qzone.command("unbind")
@@ -4472,21 +5677,17 @@ class QzoneStablePlugin(Star):
         if not self._is_admin(event):
             yield self._command_result(event, "只有管理员可以发说说。")
             return
-        post = collect_post_payload(
+        post = await self._collect_target_post_payload(
             event,
-            fallback_content=content,
+            content,
+            ("qzone post",),
             include_event_text=True,
-            command_prefixes=("qzone post",),
         )
         profile_task: asyncio.Task | None = None
         try:
             await self._ensure_cookie_ready(event)
             profile_task = self._schedule_publisher_profile(event)
-            payload = await self.controller.publish_post(
-                content=post.content,
-                media=[item.to_dict() for item in post.media],
-                content_sanitized=True,
-            )
+            post, payload = await self._publish_post_payload(post, event=event)
         except QzoneBridgeError as exc:
             if profile_task is not None:
                 profile_task.cancel()
@@ -4642,22 +5843,18 @@ class QzoneStablePlugin(Star):
                 {"ok": False, "tool": "qzone_publish_post", "public_reason": "没有权限"},
                 self._llm_error_fallback_text("没有权限"),
             )
-        post = collect_post_payload(
+        post = await self._collect_target_post_payload(
             event,
-            fallback_content=text,
+            text,
+            ("发说说", "qzone post"),
             include_event_text=bool(get_image),
-            command_prefixes=("发说说", "qzone post"),
         )
         if not get_image:
             post.media = []
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
-            payload = await self.controller.publish_post(
-                content=post.content,
-                media=[item.to_dict() for item in post.media],
-                content_sanitized=True,
-            )
+            post, payload = await self._publish_post_payload(post, event=event)
         except QzoneBridgeError as exc:
             llm_payload = self._llm_error_payload("qzone_publish_post", exc)
             return await self._ask_llm_tool_reply(
@@ -4898,21 +6095,16 @@ class QzoneStablePlugin(Star):
             )
             yield event.plain_result(text)
             return
-        post = collect_post_payload(
+        post = await self._collect_target_post_payload(
             event,
-            fallback_content=content,
+            content,
+            ("qzone post",),
             include_event_text=False,
-            command_prefixes=("qzone post",),
             extra_media=media,
         )
         try:
             await self._ensure_cookie_ready(event)
-            payload = await self.controller.publish_post(
-                content=post.content,
-                sync_weibo=sync_weibo,
-                media=[item.to_dict() for item in post.media],
-                content_sanitized=True,
-            )
+            post, payload = await self._publish_post_payload(post, sync_weibo=sync_weibo, event=event)
         except QzoneBridgeError as exc:
             text = await self._ask_llm_tool_reply(
                 event,

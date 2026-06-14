@@ -16,6 +16,31 @@ import httpx
 
 from .errors import QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .astrbot_logging import get_logger
+from .h5_video import (
+    QzoneH5VideoCoverUploadResult,
+    QzoneH5VideoUploadResult,
+    build_h5_video_cover_control_payload,
+    build_h5_video_control_payload,
+    build_qzone_video_publish_payload,
+    build_qzone_video_visibility_update_payload,
+    encode_h5_video_cover_slice_multipart,
+    encode_h5_video_slice_multipart,
+    extract_h5_control_session,
+    extract_h5_video_cover_photo_id,
+    extract_h5_video_vid,
+    h5_video_cover_control_url,
+    h5_video_cover_slice_url,
+    h5_video_control_url,
+    h5_video_format,
+    h5_video_gtk,
+    h5_video_slice_url,
+    h5_video_token_data,
+    md5_file,
+    qzone_h5_video_upload_available,
+    resolve_h5_cover_image_size,
+    sha1_file,
+    QZONE_H5_UPLOAD_ORIGIN,
+)
 from .media import (
     QZONE_MAX_IMAGES,
     QZONE_MIN_IMAGE_SIDE,
@@ -42,6 +67,8 @@ from .source_policy import is_remote_media_url_allowed, is_windows_drive_path, r
 from .utils import extract_callback_json, json_loads, now_iso
 
 log = get_logger(__name__)
+H5_VIDEO_REQUEST_TIMEOUT_SECONDS = 300.0
+H5_VIDEO_SLICE_REQUEST_TIMEOUT_SECONDS = 300.0
 
 AUTH_ERROR_CODES = {-3000}
 AUTH_ERROR_KEYWORDS = (
@@ -64,8 +91,23 @@ QZONE_UNLIKE_PROXY_URL = "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/
 QZONE_LIKE_URL = QZONE_LIKE_DIRECT_URL
 QZONE_UNLIKE_URL = QZONE_UNLIKE_DIRECT_URL
 QZONE_VISITOR_URL = "https://h5.qzone.qq.com/proxy/domain/g.qzone.qq.com/cgi-bin/friendshow/cgi_get_visitor_more"
+QZONE_PUBLISH_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6"
 QZONE_REPLY_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
 QZONE_DELETE_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_delete_v6"
+QZONE_UPDATE_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_update"
+QZONE_VIDEO_GET_DATA_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/video_get_data"
+QZONE_ALBUM_LIST_URL = "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/cgi_list_album"
+QZONE_ALBUM_LIST_V3_URL = "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/fcg_list_album_v3"
+QZONE_ALBUM_CREATE_URL = "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/cgi_create_album"
+QZONE_ALBUM_ADD_V2_URL = "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/common/cgi_add_album_v2"
+QZONE_PUBLIC_VIDEO_ALBUM_NAME = "QzoneVideoDirect"
+QZONE_EMPTY_VIDEO_UPDATE_CONTENT = "\u200b"
+QZONE_EMPTY_VIDEO_UPDATE_CONTENT_FALLBACKS = (
+    QZONE_EMPTY_VIDEO_UPDATE_CONTENT,
+    "\u2060",
+    "\u2800",
+    "分享视频",
+)
 MAX_UPLOAD_IMAGE_BYTES: int | None = None
 IMAGE_SOURCE_CACHE_TTL_SECONDS = 10 * 60
 IMAGE_SOURCE_CACHE_MAX_ITEMS = 16
@@ -140,6 +182,9 @@ class QzoneClient:
         self.session = session
         self._normalize_session()
 
+    def h5_video_upload_available(self) -> bool:
+        return qzone_h5_video_upload_available(self.session)
+
     def _cached_image_source(self, source: str) -> tuple[bytes, str] | None:
         cached = self._image_source_cache.get(source)
         if cached is None:
@@ -178,11 +223,37 @@ class QzoneClient:
         return data
 
     @staticmethod
+    def _payload_ret_code(payload: Any) -> int:
+        if not isinstance(payload, dict):
+            return 0
+        for key in ("ret", "code", "err", "error"):
+            if key not in payload or payload.get(key) in (None, ""):
+                continue
+            try:
+                return int(payload.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    @staticmethod
     def _payload_needs_rebind(code: int, message: str) -> bool:
         if code in AUTH_ERROR_CODES:
             return True
         normalized = message.lower()
         return any(keyword in message or keyword in normalized for keyword in AUTH_ERROR_KEYWORDS)
+
+    @staticmethod
+    def _is_empty_content_update_error(exc: Exception) -> bool:
+        if not isinstance(exc, QzoneRequestError):
+            return False
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        raw_code = detail.get("code", detail.get("ret"))
+        try:
+            code = int(raw_code or 0)
+        except (TypeError, ValueError):
+            code = 0
+        message = str(detail.get("message") or detail.get("msg") or exc)
+        return code == -10005 or "未输入内容" in message
 
     def _raise_payload_error(self, payload: Any, response: httpx.Response) -> None:
         if not isinstance(payload, dict):
@@ -288,6 +359,27 @@ class QzoneClient:
             headers.update(extra)
         return headers
 
+    def _pc_headers(self, *, referer: str | None = None, origin: str | None = None) -> dict[str, str]:
+        """Headers for PC Qzone form endpoints such as emotion_cgi_update."""
+
+        headers = self._headers(
+            referer=referer or f"https://user.qzone.qq.com/{self.login_uin}/main",
+            origin=origin or "https://user.qzone.qq.com",
+            extra={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-site",
+                "Cache-Control": "max-age=0",
+            },
+        )
+        return headers
+
     def _media_download_headers(self) -> dict[str, str]:
         return {
             "User-Agent": self.user_agent,
@@ -314,6 +406,7 @@ class QzoneClient:
         params: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
         json_body: Any | None = None,
+        headers: dict[str, str] | None = None,
         referer: str | None = None,
         origin: str | None = None,
         hostuin: int | None = None,
@@ -322,6 +415,7 @@ class QzoneClient:
         follow_qzone_redirects: bool = False,
         accept_qzone_redirects: bool = False,
         max_attempts: int | None = None,
+        timeout: float | None = None,
     ) -> httpx.Response:
         if login_required and not self.session.cookies:
             raise QzoneNeedsRebind()
@@ -337,14 +431,16 @@ class QzoneClient:
                 current_params = params
                 redirects_left = 3
                 while True:
-                    response = await self._client.request(
-                        method,
-                        current_url,
-                        params=current_params,
-                        data=data,
-                        json=json_body,
-                        headers=self._headers(referer=referer, origin=origin),
-                    )
+                    request_headers = headers or self._headers(referer=referer, origin=origin)
+                    request_kwargs: dict[str, Any] = {
+                        "params": current_params,
+                        "data": data,
+                        "json": json_body,
+                        "headers": request_headers,
+                    }
+                    if timeout is not None:
+                        request_kwargs["timeout"] = max(float(timeout), float(self.timeout or 0.001))
+                    response = await self._client.request(method, current_url, **request_kwargs)
                     self._persist_cookie_response(response)
                     location = response.headers.get("location") or response.headers.get("Location") or ""
                     if response.status_code in QZONE_REDIRECT_STATUS_CODES and self._is_qzone_home_redirect(response):
@@ -463,6 +559,7 @@ class QzoneClient:
         params: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
         json_body: Any | None = None,
+        headers: dict[str, str] | None = None,
         referer: str | None = None,
         origin: str | None = None,
         hostuin: int | None = None,
@@ -471,6 +568,7 @@ class QzoneClient:
         follow_qzone_redirects: bool = False,
         accept_qzone_redirects: bool = False,
         max_attempts: int | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         response = await self._request_text(
             method,
@@ -478,6 +576,7 @@ class QzoneClient:
             params=params,
             data=data,
             json_body=json_body,
+            headers=headers,
             referer=referer,
             origin=origin,
             hostuin=hostuin,
@@ -486,6 +585,7 @@ class QzoneClient:
             follow_qzone_redirects=follow_qzone_redirects,
             accept_qzone_redirects=accept_qzone_redirects,
             max_attempts=max_attempts,
+            timeout=timeout,
         )
         if accept_qzone_redirects and response.status_code in QZONE_REDIRECT_STATUS_CODES:
             return {"message": "accepted redirect", "redirect": self._response_detail(response)}
@@ -664,6 +764,51 @@ class QzoneClient:
         )
         return payload
 
+    async def video_get_data(
+        self,
+        hostuin: int,
+        *,
+        get_method: int = 2,
+        start: int = 0,
+        count: int = 20,
+        need_old: int = 1,
+        get_user_info: int = 1,
+    ) -> dict[str, Any]:
+        """Fetch Qzone's appid=4 video/photo timeline data.
+
+        This is the same endpoint used by Qzone photo managers to enumerate
+        uploaded videos.  The H5 local-video publish path can expose the real,
+        public video artifact here even when the appid=311 mood wrapper detail
+        remains unsuitable for public-video verification.
+        """
+
+        hostuin = int(hostuin or self.login_uin or 0)
+        if not hostuin:
+            raise QzoneNeedsRebind("Cookie 缺少登录 UIN，无法读取 Qzone 视频列表")
+        payload = await self._request_json(
+            "GET",
+            QZONE_VIDEO_GET_DATA_URL,
+            params={
+                "uin": self.login_uin,
+                "hostUin": hostuin,
+                "appid": 4,
+                "getMethod": int(get_method),
+                "start": max(0, int(start)),
+                "count": max(1, min(int(count), 50)),
+                "need_old": int(need_old),
+                "getUserInfo": int(get_user_info),
+                "inCharset": "utf-8",
+                "outCharset": "utf-8",
+            },
+            referer=f"https://user.qzone.qq.com/{hostuin}",
+            origin="https://user.qzone.qq.com",
+            hostuin=hostuin,
+            attach_token=False,
+            follow_qzone_redirects=True,
+            max_attempts=1,
+        )
+        return payload
+
     async def mfeeds_get_count(self) -> dict[str, Any]:
         payload = await self._request_json(
             "GET",
@@ -694,6 +839,267 @@ class QzoneClient:
         for token in ("!!", "&", "#"):
             result = result.split(token, 1)[0]
         return unquote(result)
+
+    @staticmethod
+    def _album_text(value: Any) -> str:
+        if value in (None, ""):
+            return ""
+        text = str(value).strip()
+        return text[:-2] if text.endswith(".0") else text
+
+    @staticmethod
+    def _album_id(item: dict[str, Any]) -> str:
+        return str(
+            item.get("id")
+            or item.get("topicId")
+            or item.get("topicid")
+            or item.get("albumId")
+            or item.get("albumid")
+            or item.get("aid")
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _album_name(item: dict[str, Any]) -> str:
+        return str(item.get("name") or item.get("albumname") or item.get("albumName") or item.get("title") or "").strip()
+
+    @staticmethod
+    def _album_priv(item: dict[str, Any]) -> str:
+        return QzoneClient._album_text(
+            item.get("priv")
+            if item.get("priv") not in (None, "")
+            else item.get("privacy")
+            if item.get("privacy") not in (None, "")
+            else item.get("viewtype")
+            if item.get("viewtype") not in (None, "")
+            else item.get("right")
+        )
+
+    @staticmethod
+    def _album_handset(item: dict[str, Any]) -> str:
+        return QzoneClient._album_text(
+            item.get("handset")
+            if item.get("handset") not in (None, "")
+            else item.get("albumTypeID")
+            if item.get("albumTypeID") not in (None, "")
+            else item.get("albumtype")
+            if item.get("albumtype") not in (None, "")
+            else item.get("type")
+        )
+
+    @staticmethod
+    def _album_is_locked_shuoshuo_album(item: dict[str, Any]) -> bool:
+        # Current Qzone web hides permission editing for the special
+        # handset=7 + priv=3 "说说和日志相册".  Binding a video resource here
+        # leaves the appid=4 video layer private even after emotion_cgi_update
+        # succeeds on the appid=311 mood wrapper.
+        name = QzoneClient._album_name(item)
+        return bool(
+            (QzoneClient._album_handset(item) == "7" and QzoneClient._album_priv(item) == "3")
+            or "说说和日志相册" in name
+        )
+
+    @staticmethod
+    def _album_is_public(item: dict[str, Any]) -> bool:
+        if not QzoneClient._album_id(item):
+            return False
+        if QzoneClient._album_is_locked_shuoshuo_album(item):
+            return False
+        return QzoneClient._album_priv(item) == "1"
+
+    @staticmethod
+    def _collect_album_items(value: Any, *, depth: int = 0) -> list[dict[str, Any]]:
+        if depth > 8:
+            return []
+        albums: list[dict[str, Any]] = []
+        if isinstance(value, dict):
+            if QzoneClient._album_id(value) and (
+                "priv" in value
+                or "albumname" in value
+                or "albumName" in value
+                or "name" in value
+                or "topicId" in value
+                or "albumid" in value
+                or "albumId" in value
+            ):
+                albums.append(value)
+            for key, item in value.items():
+                key_text = str(key).lower()
+                if "album" in key_text or key_text in {"data", "list", "items"}:
+                    albums.extend(QzoneClient._collect_album_items(item, depth=depth + 1))
+        elif isinstance(value, list):
+            for item in value:
+                albums.extend(QzoneClient._collect_album_items(item, depth=depth + 1))
+        return albums
+
+    @staticmethod
+    def _safe_album_detail(item: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(item, dict):
+            return {}
+        return {
+            "id": QzoneClient._album_id(item),
+            "name": QzoneClient._album_name(item),
+            "priv": QzoneClient._album_priv(item),
+            "handset": QzoneClient._album_handset(item),
+            "locked_shuoshuo_album": QzoneClient._album_is_locked_shuoshuo_album(item),
+        }
+
+    async def list_albums(self, uin: int | None = None) -> list[dict[str, Any]]:
+        target_uin = int(uin or self.login_uin or 0)
+        if not target_uin:
+            raise QzoneNeedsRebind("Cookie 缺少登录 UIN，无法读取相册列表")
+        common_params = {
+            "uin": target_uin,
+            "hostUin": target_uin,
+            "appid": 4,
+            "inCharset": "utf-8",
+            "outCharset": "utf-8",
+            "source": "qzone",
+            "plat": "qzone",
+            "notice": 0,
+        }
+        attempts = (
+            (
+                QZONE_ALBUM_LIST_URL,
+                {**common_params, "format": "json"},
+            ),
+            (
+                QZONE_ALBUM_LIST_V3_URL,
+                {**common_params, "format": "jsonp", "json_esc": 1},
+            ),
+        )
+        for url, params in attempts:
+            try:
+                payload = await self._request_json(
+                    "GET",
+                    url,
+                    params=params,
+                    referer=f"https://user.qzone.qq.com/{target_uin}/photo",
+                    origin="https://user.qzone.qq.com",
+                    hostuin=target_uin,
+                    attach_token=False,
+                    follow_qzone_redirects=True,
+                    max_attempts=1,
+                    timeout=H5_VIDEO_REQUEST_TIMEOUT_SECONDS,
+                )
+            except (QzoneRequestError, QzoneParseError) as exc:
+                log.debug("qzone album list endpoint failed url=%s error=%s", url, exc)
+                continue
+            albums = self._collect_album_items(payload)
+            if albums:
+                return albums
+        return []
+
+    async def create_public_video_album(self, name: str = QZONE_PUBLIC_VIDEO_ALBUM_NAME, desc: str = "") -> dict[str, Any]:
+        if not self.login_uin:
+            raise QzoneNeedsRebind("Cookie 缺少登录 UIN，无法创建相册")
+        album_name = str(name or QZONE_PUBLIC_VIDEO_ALBUM_NAME)
+        base_data = {
+            "hostUin": self.login_uin,
+            "uin": self.login_uin,
+            "albumname": album_name,
+            "albumdesc": str(desc or ""),
+            "priv": "1",
+            "format": "json",
+            "qzreferrer": f"https://user.qzone.qq.com/{self.login_uin}/photo",
+        }
+        attempts = (
+            (
+                QZONE_ALBUM_CREATE_URL,
+                base_data,
+            ),
+            (
+                QZONE_ALBUM_ADD_V2_URL,
+                {
+                    **base_data,
+                    "album_type": "",
+                    "albumclass": "100",
+                    "question": "",
+                    "answer": "",
+                    "whiteList": "",
+                    "bitmap": "10000000",
+                    "appid": 4,
+                    "inCharset": "utf-8",
+                    "outCharset": "utf-8",
+                    "source": "qzone",
+                    "plat": "qzone",
+                    "notice": 0,
+                },
+            ),
+        )
+        last_error: Exception | None = None
+        for url, data in attempts:
+            try:
+                return await self._request_json(
+                    "POST",
+                    url,
+                    data=data,
+                    headers=self._pc_headers(referer=f"https://user.qzone.qq.com/{self.login_uin}/photo"),
+                    referer=f"https://user.qzone.qq.com/{self.login_uin}/photo",
+                    origin="https://user.qzone.qq.com",
+                    hostuin=self.login_uin,
+                    attach_token=False,
+                    max_attempts=1,
+                    timeout=H5_VIDEO_REQUEST_TIMEOUT_SECONDS,
+                )
+            except (QzoneRequestError, QzoneParseError) as exc:
+                last_error = exc
+                log.debug("qzone public album create endpoint failed url=%s error=%s", url, exc)
+                continue
+        if isinstance(last_error, QzoneRequestError):
+            raise last_error
+        if isinstance(last_error, QzoneParseError):
+            raise last_error
+        raise QzoneRequestError("QQ 空间公开相册创建失败", detail={"album_name": album_name})
+
+    async def ensure_public_video_album(self, name: str = QZONE_PUBLIC_VIDEO_ALBUM_NAME) -> dict[str, Any]:
+        albums = await self.list_albums()
+        public_albums = [item for item in albums if isinstance(item, dict) and self._album_is_public(item)]
+        for preferred_name in (name, QZONE_PUBLIC_VIDEO_ALBUM_NAME, "Qzone视频直发", "视频直发"):
+            for item in public_albums:
+                if self._album_name(item) == preferred_name:
+                    return item
+
+        create_error: Exception | None = None
+        try:
+            created = await self.create_public_video_album(name=name)
+        except (QzoneRequestError, QzoneParseError) as exc:
+            create_error = exc
+            if public_albums:
+                return public_albums[0]
+            raise
+        created_albums = self._collect_album_items(created)
+        for item in created_albums:
+            if self._album_id(item):
+                return item
+        album_id = str(
+            created.get("albumid")
+            or created.get("albumId")
+            or created.get("topicId")
+            or created.get("id")
+            or created.get("aid")
+            or ""
+        ).strip()
+        if album_id:
+            return {"id": album_id, "name": name, "priv": 1, "handset": 0, "raw": created}
+
+        # Some Qzone create-album responses only return ret/code=0.  Re-list
+        # and select the named public album before giving up.
+        albums_after_create = await self.list_albums()
+        for item in albums_after_create:
+            if self._album_is_public(item) and self._album_name(item) == name:
+                return item
+        if public_albums:
+            return public_albums[0]
+        raise QzoneRequestError(
+            "QQ 空间公开相册已请求创建，但未能确认可绑定的相册 ID",
+            detail={
+                "album_name": name,
+                "create_result": created,
+                "album_count_after_create": len(albums_after_create),
+                "create_error": str(create_error) if create_error is not None else "",
+            },
+        )
 
     async def _load_image_source(self, media: dict[str, Any]) -> tuple[bytes, str, str]:
         item = normalize_media_item(media, default_kind="image")
@@ -914,6 +1320,298 @@ class QzoneClient:
             raise QzoneParseError(f"QQ 空间一次最多只能上传 {QZONE_MAX_IMAGES} 张图片")
         return final
 
+    async def upload_h5_video(
+        self,
+        video_path: str | Path,
+        *,
+        title: str = "",
+        desc: str = "",
+        play_time: int = 0,
+        upload_time: int | None = None,
+        extend_info: dict[str, str] | None = None,
+    ) -> QzoneH5VideoUploadResult:
+        path = Path(video_path)
+        if not path.is_file():
+            raise QzoneParseError("视频文件不存在，无法使用 Qzone H5 原生上传", detail={"path": str(path)})
+        file_size = path.stat().st_size
+        if file_size <= 0:
+            raise QzoneParseError("视频文件为空，无法使用 Qzone H5 原生上传", detail={"path": str(path)})
+        if not self.login_uin:
+            raise QzoneNeedsRebind("Cookie 缺少登录 UIN，无法使用 Qzone H5 原生视频上传")
+        if not qzone_h5_video_upload_available(self.session):
+            raise QzoneNeedsRebind("Cookie 缺少 p_skey，无法使用 Qzone H5 原生视频上传")
+
+        p_skey = h5_video_token_data(self.session)
+        h5_gtk = h5_video_gtk(self.session.cookies)
+        checksum = await asyncio.to_thread(sha1_file, path)
+        control_payload = build_h5_video_control_payload(
+            uin=self.login_uin,
+            p_skey=p_skey,
+            checksum=checksum,
+            file_size=file_size,
+            title=title or path.name,
+            desc=desc,
+            play_time=play_time,
+            upload_time=upload_time,
+            video_format=h5_video_format(path),
+            extend_info=extend_info,
+        )
+        control_response = await self._request_json(
+            "POST",
+            h5_video_control_url(checksum),
+            params={"g_tk": h5_gtk},
+            json_body=control_payload,
+            referer=QZONE_H5_UPLOAD_ORIGIN,
+            origin=QZONE_H5_UPLOAD_ORIGIN,
+            hostuin=self.login_uin,
+            attach_token=False,
+            timeout=H5_VIDEO_REQUEST_TIMEOUT_SECONDS,
+        )
+        session, slice_size = extract_h5_control_session(control_response)
+        if not session:
+            raise QzoneRequestError("Qzone H5 视频上传控制响应缺少 session", detail=control_response)
+
+        upload_responses: list[dict[str, Any]] = []
+        vid = ""
+        offset = 0
+        seq = 1
+        with path.open("rb") as handle:
+            while offset < file_size:
+                chunk = handle.read(min(slice_size, file_size - offset))
+                if not chunk:
+                    break
+                end = offset + len(chunk)
+                payload: dict[str, Any] | None = None
+                response: httpx.Response | None = None
+                for index, data_content_type in enumerate(("application/octet-stream", None)):
+                    body, content_type = encode_h5_video_slice_multipart(
+                        uin=self.login_uin,
+                        session=session,
+                        seq=seq,
+                        offset=offset,
+                        end=end,
+                        slice_size=slice_size,
+                        chunk=chunk,
+                        data_content_type=data_content_type,
+                    )
+                    response = await self._client.request(
+                        "POST",
+                        h5_video_slice_url(),
+                        params={
+                            "seq": seq,
+                            "retry": index,
+                            "offset": offset,
+                            "end": end,
+                            "total": file_size,
+                            "type": "form",
+                            "g_tk": h5_gtk,
+                        },
+                        content=body,
+                        headers=self._headers(
+                            referer=QZONE_H5_UPLOAD_ORIGIN,
+                            origin=QZONE_H5_UPLOAD_ORIGIN,
+                            extra={"Content-Type": content_type},
+                        ),
+                        timeout=max(float(self.timeout or 0.0), H5_VIDEO_SLICE_REQUEST_TIMEOUT_SECONDS),
+                    )
+                    self._persist_cookie_response(response)
+                    if response.status_code >= 400:
+                        raise QzoneRequestError(
+                            f"Qzone H5 视频分片上传 HTTP {response.status_code}",
+                            status_code=response.status_code,
+                            detail=self._response_detail(response),
+                        )
+                    parsed_payload = self._parse_response_payload(response.text.strip(), response)
+                    unwrapped_payload = unwrap_payload(parsed_payload)
+                    ret_code = self._payload_ret_code(parsed_payload)
+                    if ret_code == 0:
+                        ret_code = self._payload_ret_code(unwrapped_payload)
+                    if ret_code == -115 and data_content_type is not None:
+                        log.debug("qzone h5 video slice rejected octet-stream blob; retrying without blob content-type")
+                        continue
+                    self._raise_payload_error(parsed_payload, response)
+                    self._raise_payload_error(unwrapped_payload, response)
+                    payload = unwrapped_payload if isinstance(unwrapped_payload, dict) else {"data": unwrapped_payload}
+                    break
+                assert response is not None
+                assert payload is not None
+                if not isinstance(payload, dict):
+                    payload = {"data": payload}
+                upload_responses.append(payload)
+                vid = extract_h5_video_vid(payload) or vid
+                offset = end
+                seq += 1
+
+        if not vid:
+            raise QzoneRequestError(
+                "Qzone H5 视频上传完成但未返回 sVid",
+                detail={"checksum": checksum, "session": session, "uploaded_bytes": offset},
+            )
+        return QzoneH5VideoUploadResult(
+            vid=vid,
+            checksum=checksum,
+            uploaded_bytes=offset,
+            session=session,
+            slice_size=slice_size,
+            control_response=control_response,
+            upload_responses=upload_responses,
+        )
+
+    async def upload_h5_video_cover(
+        self,
+        cover_path: str | Path,
+        *,
+        vid: str,
+        video_path: str | Path | None = None,
+        client_key: str = "",
+        video_size: int = 0,
+        duration_ms: int = 0,
+        desc: str = "",
+        upload_time: int | None = None,
+        width: int = 0,
+        height: int = 0,
+        need_feeds: int = 0,
+        extra_map_ext: dict[str, str] | None = None,
+        extra_params: dict[str, str] | None = None,
+        album_id: str = "",
+        album_name: str = "",
+        album_type_id: int | None = None,
+    ) -> QzoneH5VideoCoverUploadResult:
+        path = Path(cover_path)
+        if not path.is_file():
+            raise FileNotFoundError(str(path))
+        file_size = path.stat().st_size
+        if file_size <= 0:
+            raise QzoneParseError("视频封面文件为空，无法使用 Qzone H5 原生视频封面上传", detail={"path": str(path)})
+        vid = str(vid or "").strip()
+        if not vid:
+            raise QzoneParseError("Qzone H5 视频封面上传缺少 sVid")
+        if not self.login_uin:
+            raise QzoneNeedsRebind("Cookie 缺少登录 UIN，无法使用 Qzone H5 原生视频封面上传")
+        if not qzone_h5_video_upload_available(self.session):
+            raise QzoneNeedsRebind("Cookie 缺少 p_skey，无法使用 Qzone H5 原生视频封面上传")
+
+        p_skey = h5_video_token_data(self.session)
+        h5_gtk = h5_video_gtk(self.session.cookies)
+        checksum = await asyncio.to_thread(md5_file, path)
+        width, height = await asyncio.to_thread(resolve_h5_cover_image_size, path, width, height)
+        control_payload = build_h5_video_cover_control_payload(
+            uin=self.login_uin,
+            p_skey=p_skey,
+            checksum=checksum,
+            file_size=file_size,
+            vid=vid,
+            client_key=client_key,
+            video_size=video_size,
+            duration_ms=duration_ms,
+            desc=desc,
+            cover_path=path,
+            width=width,
+            height=height,
+            upload_time=upload_time,
+            need_feeds=need_feeds,
+            extra_map_ext=extra_map_ext,
+            extra_params=extra_params,
+            album_id=album_id,
+            album_name=album_name,
+            album_type_id=album_type_id,
+        )
+        control_response = await self._request_json(
+            "POST",
+            h5_video_cover_control_url(checksum),
+            params={"g_tk": h5_gtk},
+            json_body=control_payload,
+            referer=QZONE_H5_UPLOAD_ORIGIN,
+            origin=QZONE_H5_UPLOAD_ORIGIN,
+            hostuin=self.login_uin,
+            attach_token=False,
+            timeout=H5_VIDEO_REQUEST_TIMEOUT_SECONDS,
+        )
+        session, slice_size = extract_h5_control_session(control_response)
+        if not session:
+            raise QzoneRequestError("Qzone H5 视频封面上传控制响应缺少 session", detail=control_response)
+
+        upload_responses: list[dict[str, Any]] = []
+        photo_id = ""
+        offset = 0
+        seq = 1
+        with path.open("rb") as handle:
+            while offset < file_size:
+                chunk = handle.read(min(slice_size, file_size - offset))
+                if not chunk:
+                    break
+                end = offset + len(chunk)
+                payload: dict[str, Any] | None = None
+                response: httpx.Response | None = None
+                for index, data_content_type in enumerate(("application/octet-stream", None)):
+                    body, content_type = encode_h5_video_cover_slice_multipart(
+                        uin=self.login_uin,
+                        session=session,
+                        seq=seq,
+                        offset=offset,
+                        end=end,
+                        slice_size=slice_size,
+                        chunk=chunk,
+                        data_content_type=data_content_type,
+                    )
+                    response = await self._client.request(
+                        "POST",
+                        h5_video_cover_slice_url(),
+                        params={
+                            "seq": seq,
+                            "retry": index,
+                            "offset": offset,
+                            "end": end,
+                            "total": file_size,
+                            "type": "form",
+                            "g_tk": h5_gtk,
+                        },
+                        content=body,
+                        headers=self._headers(
+                            referer=QZONE_H5_UPLOAD_ORIGIN,
+                            origin=QZONE_H5_UPLOAD_ORIGIN,
+                            extra={"Content-Type": content_type},
+                        ),
+                        timeout=max(float(self.timeout or 0.0), H5_VIDEO_SLICE_REQUEST_TIMEOUT_SECONDS),
+                    )
+                    self._persist_cookie_response(response)
+                    if response.status_code >= 400:
+                        raise QzoneRequestError(
+                            f"Qzone H5 视频封面分片上传 HTTP {response.status_code}",
+                            status_code=response.status_code,
+                            detail=self._response_detail(response),
+                        )
+                    parsed_payload = self._parse_response_payload(response.text.strip(), response)
+                    unwrapped_payload = unwrap_payload(parsed_payload)
+                    ret_code = self._payload_ret_code(parsed_payload)
+                    if ret_code == 0:
+                        ret_code = self._payload_ret_code(unwrapped_payload)
+                    if ret_code == -115 and data_content_type is not None:
+                        log.debug("qzone h5 cover slice rejected octet-stream blob; retrying without blob content-type")
+                        continue
+                    self._raise_payload_error(parsed_payload, response)
+                    self._raise_payload_error(unwrapped_payload, response)
+                    payload = unwrapped_payload if isinstance(unwrapped_payload, dict) else {"data": unwrapped_payload}
+                    break
+                assert response is not None
+                assert payload is not None
+                if not isinstance(payload, dict):
+                    payload = {"data": payload}
+                upload_responses.append(payload)
+                photo_id = extract_h5_video_cover_photo_id(payload) or photo_id
+                offset = end
+                seq += 1
+
+        return QzoneH5VideoCoverUploadResult(
+            checksum=checksum,
+            uploaded_bytes=offset,
+            session=session,
+            slice_size=slice_size,
+            photo_id=photo_id,
+            control_response=control_response,
+            upload_responses=upload_responses,
+        )
+
     async def publish_mood(self, content: str, *, sync_weibo: bool = False, photos: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         photos = await self._prepare_publish_photos(photos)
         richval = "\t".join(photo.get("richval", "") for photo in photos if isinstance(photo, dict))
@@ -945,7 +1643,7 @@ class QzoneClient:
             )
         payload = await self._request_json(
             "POST",
-            "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6",
+            QZONE_PUBLISH_URL,
             data=data,
             referer=f"https://user.qzone.qq.com/{self.login_uin}",
             origin="https://user.qzone.qq.com",
@@ -953,6 +1651,96 @@ class QzoneClient:
             attach_token=False,
         )
         return payload
+
+    async def publish_video_mood(self, content: str, *, vid: str, sync_weibo: bool = False) -> dict[str, Any]:
+        vid = str(vid or "").strip()
+        if not vid:
+            raise QzoneParseError("发布 Qzone 视频说说缺少 sVid")
+        if not self.login_uin:
+            raise QzoneNeedsRebind("Cookie 缺少登录 UIN，无法发布 Qzone 视频说说")
+        data = build_qzone_video_publish_payload(
+            uin=self.login_uin,
+            content=content,
+            vid=vid,
+            sync_weibo=sync_weibo,
+        )
+        return await self._request_json(
+            "POST",
+            QZONE_PUBLISH_URL,
+            data=data,
+            referer=f"https://user.qzone.qq.com/{self.login_uin}",
+            origin="https://user.qzone.qq.com",
+            hostuin=self.login_uin,
+            attach_token=False,
+            max_attempts=1,
+            timeout=H5_VIDEO_REQUEST_TIMEOUT_SECONDS,
+        )
+
+    async def update_mood_visibility_public(
+        self,
+        fid: str,
+        *,
+        content: str = "",
+        vid: str = "",
+    ) -> dict[str, Any]:
+        fid = str(fid or "").strip()
+        if not fid:
+            raise QzoneParseError("修改 Qzone 视频说说权限缺少 tid/fid")
+        if not self.login_uin:
+            raise QzoneNeedsRebind("Cookie 缺少登录 UIN，无法修改 Qzone 视频说说权限")
+        data = build_qzone_video_visibility_update_payload(
+            uin=self.login_uin,
+            fid=fid,
+            content=content,
+            vid=vid,
+        )
+        referer = f"https://user.qzone.qq.com/{self.login_uin}/main"
+        try:
+            return await self._request_json(
+                "POST",
+                QZONE_UPDATE_URL,
+                data=data,
+                headers=self._pc_headers(referer=referer),
+                referer=referer,
+                hostuin=self.login_uin,
+                attach_token=False,
+                max_attempts=1,
+                timeout=H5_VIDEO_REQUEST_TIMEOUT_SECONDS,
+            )
+        except QzoneRequestError as exc:
+            if str(content or "").strip() or not self._is_empty_content_update_error(exc):
+                raise
+
+        last_retry_error: QzoneRequestError | None = None
+        for index, retry_content in enumerate(QZONE_EMPTY_VIDEO_UPDATE_CONTENT_FALLBACKS, start=1):
+            retry_data = build_qzone_video_visibility_update_payload(
+                uin=self.login_uin,
+                fid=fid,
+                content=retry_content,
+                vid=vid,
+            )
+            try:
+                result = await self._request_json(
+                    "POST",
+                    QZONE_UPDATE_URL,
+                    data=retry_data,
+                    headers=self._pc_headers(referer=referer),
+                    referer=referer,
+                    hostuin=self.login_uin,
+                    attach_token=False,
+                    max_attempts=1,
+                    timeout=H5_VIDEO_REQUEST_TIMEOUT_SECONDS,
+                )
+            except QzoneRequestError as retry_exc:
+                last_retry_error = retry_exc
+                if not self._is_empty_content_update_error(retry_exc):
+                    raise
+                continue
+            result.setdefault("empty_content_retry", index)
+            return result
+        if last_retry_error is not None:
+            raise last_retry_error
+        raise QzoneRequestError("QQ 空间修改说说权限失败：空内容兼容重试未执行", detail={"fid": fid})
 
     async def add_comment(
         self,

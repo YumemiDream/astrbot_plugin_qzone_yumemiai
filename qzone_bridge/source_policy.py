@@ -11,6 +11,23 @@ from urllib.parse import urljoin, urlparse
 REMOTE_MEDIA_SCHEMES = {"http", "https"}
 WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 UNSAFE_HOST_NAMES = {"localhost", "localhost.localdomain"}
+PROXY_FAKE_IP_NETWORKS = (
+    ipaddress.ip_network("198.18.0.0/15"),
+)
+TRUSTED_REMOTE_MEDIA_HOST_SUFFIXES = (
+    "multimedia.nt.qq.com.cn",
+    "qpic.cn",
+    "gtimg.cn",
+    "qlogo.cn",
+    "qzone.qq.com",
+    "photo.qq.com",
+)
+DNS_EXEMPT_TRUSTED_REMOTE_MEDIA_HOSTS = {
+    "multimedia.nt.qq.com.cn",
+}
+DNS_EXEMPT_TRUSTED_REMOTE_MEDIA_PATH_PREFIXES = {
+    "multimedia.nt.qq.com.cn": ("/download",),
+}
 
 
 def is_windows_drive_path(source: str) -> bool:
@@ -24,7 +41,13 @@ def is_remote_media_url_allowed(source: str) -> bool:
     host = parsed.hostname
     if not host:
         return False
-    return not is_unsafe_media_host(host) and remote_media_host_resolves_safely(host)
+    return (
+        not is_unsafe_media_host(host)
+        and (
+            is_dns_exempt_trusted_remote_media_url(source)
+            or remote_media_host_resolves_safely(host)
+        )
+    )
 
 
 def is_unsafe_media_host(host: str) -> bool:
@@ -45,6 +68,57 @@ def is_unsafe_media_host(host: str) -> bool:
     )
 
 
+def is_trusted_remote_media_host(host: str) -> bool:
+    normalized = str(host or "").strip().lower().rstrip(".")
+    if not normalized or is_unsafe_media_host(normalized):
+        return False
+    return any(normalized == suffix or normalized.endswith(f".{suffix}") for suffix in TRUSTED_REMOTE_MEDIA_HOST_SUFFIXES)
+
+
+def is_dns_exempt_trusted_remote_media_url(source: str) -> bool:
+    """Return whether a QQ first-party media URL may bypass local DNS safety checks.
+
+    Some QQ/QQNT media downloads are served from ``multimedia.nt.qq.com.cn`` but
+    resolve to RFC 2544 fake/proxy addresses, and in some proxy/DNS setups can
+    also appear as non-public addresses. The URL still represents a Tencent
+    HTTPS media origin, so allow only the exact host and download path here
+    rather than treating the temporary resolver answer as an unsafe user URL.
+    """
+
+    parsed = urlparse(str(source or "").strip())
+    if parsed.scheme.lower() != "https":
+        return False
+    host = str(parsed.hostname or "").strip().lower().rstrip(".")
+    if host not in DNS_EXEMPT_TRUSTED_REMOTE_MEDIA_HOSTS:
+        return False
+    if is_unsafe_media_host(host):
+        return False
+    path = parsed.path or "/"
+    return any(
+        path == prefix or path.startswith(f"{prefix}/")
+        for prefix in DNS_EXEMPT_TRUSTED_REMOTE_MEDIA_PATH_PREFIXES.get(host, ())
+    )
+
+
+def is_proxy_fake_ip_address(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(str(value or "").strip().strip("[]"))
+    except ValueError:
+        return False
+    return any(address in network for network in PROXY_FAKE_IP_NETWORKS)
+
+
+def _remote_media_addresses_are_safe_for_host(host: str, addresses: set[str]) -> bool:
+    if not addresses:
+        return False
+    if is_trusted_remote_media_host(host):
+        return all(
+            is_proxy_fake_ip_address(address) or not is_unsafe_media_host(address)
+            for address in addresses
+        )
+    return not any(is_unsafe_media_host(address) for address in addresses)
+
+
 @lru_cache(maxsize=512)
 def remote_media_host_resolves_safely(host: str) -> bool:
     normalized = str(host or "").strip().lower().rstrip(".")
@@ -62,9 +136,7 @@ def remote_media_host_resolves_safely(host: str) -> bool:
     except OSError:
         return False
     addresses = {item[4][0] for item in infos if item and item[4]}
-    if not addresses:
-        return False
-    return not any(is_unsafe_media_host(address) for address in addresses)
+    return _remote_media_addresses_are_safe_for_host(normalized, addresses)
 
 
 def resolve_remote_media_redirect(base_url: str, location: str) -> str:

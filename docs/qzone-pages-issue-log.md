@@ -2,6 +2,34 @@
 
 这个文件记录 WebUI Pages 功能实施和验证时遇到的问题、根因、修复方式和回归用例，后续维护同类功能时先看这里。
 
+## 2026-06-14 原生视频直发逆向整理
+
+### H5 视频实际产生动态但返回“链接无效”且非公开
+
+- 症状：真实 AstrBot 命令流里 daemon 返回 `publish_video_mood` 阶段“您输入的链接不是有效链接”，但 QQ 空间里实际出现了视频动态，且可见范围是“仅自己可见”。
+- 根因：`emotion_cgi_publish_v6` 对本地上传 `sVid`/richval 不是可靠的最终发布接口；它可能报链接无效，而 `video_qzone`/`pic_qzone` 上传侧仍产生动态副作用。旧代码把这个中间错误直接上抛，遮蔽了真正需要处理的权限结果。
+- 修复：H5 路径中视频上传和封面上传仍是硬失败；`publish_video_mood` 抛 `QzoneRequestError` 时只记录为 `publish_error` 并继续按 `sVid` 发现 `tid/fid`。拿到 `tid/fid` 后调用 `emotion_cgi_update` 设置 `ugc_right=1`/`who=1`，再做 feed/detail 公开校验。详情接口返回“主人设置保密”“没有访问操作权限”等访问受限错误时，验证器归因成 `private_visibility`，最终报“不是全部人可见”，不再报“链接无效”。
+- 回归用例：`publish_video_mood` 抛“链接无效”但能按同一 `sVid` 发现 `fid` 时必须继续调用权限修改；权限修改失败必须拒绝宣称成功；权限修改后 feed/detail 有明确公开视频标记才返回成功。同样中间错误叠加私密诊断时，顶层错误必须说明未达到全部人可见。
+
+### H5 `sliceUpload` + Web `publish_v6` 会产生假成功
+
+- 症状：daemon 返回 `published_native_video` 且渲染图里有视频卡片，但 QQ 空间最近动态和详情里看不到新视频。
+- 根因：H5 `FileUploadVideo` 能返回 `sVid`，但后续 `emotion_cgi_publish_v6` 的 `richtype=3/subrichtype=7/richval` 响应可能只是回显提交的 `vid/richval`，不代表生成了可见视频动态；旧 Web 官方本地视频流程实际是先通过 `qzupvideo` 或移动 `video_qzone` 上传拿到可发布视频，再作为视频附件发布。
+- 修复：daemon 不再把 H5 发布接口回显当作成功依据。使用 QQ 空间 Web Cookie/`p_skey` 时，稳定的 H5 公开视频发布必须完成视频上传、封面上传、`emotion_cgi_publish_v6`/feed 发现、`emotion_cgi_update` 公开权限修改和最终 daemon 校验。QQ upload A2/vLoginData 与协议端原生 action 只作为历史逆向和兼容边界记录。
+- 回归用例：`publish_result` 即使包含 `qzvideo/<vid>` 也必须等待权限修改后的 feed 验证；没有 QQ upload 二进制材料但 Cookie H5 可用时，命令侧应显示“视频直发：可用（公开视频校验）”，内部 method 仍为 `h5_video_publish_update_visibility`，不允许退回视频封面图或打开 QQ/QQNT 客户端。
+
+### OneBot 协议端原生视频发布仍必须校验
+
+- 症状：NapCat/LLBot 可以稳定提供 QQ 空间 Web Cookie/clientKey，但 QQ upload A2/vLoginData 可能为空，或默认 OneBot action 不会暴露。
+- 根因：更稳定的边界是让协议端在内部使用自己的 NTQQ 会话完成发布，再把结果返回插件；插件不能只把协议端响应当成最终证明。
+- 修复：插件只把 `publish_qzone_video_mood` 作为规范 OneBot 扩展 action，`_publish_qzone_video_mood` 仅作为规范 action 不可用时的兼容形式。请求会携带 `who=1`、`ugc_right=1` 和公开可见字段。协议端返回 `sVid` 后，daemon 必须通过 `/native-video/verify` 验证 `appid=311`、同一 `sVid` 和正向公开视频标记。
+- 回归用例：没有 `sVid` 的成功响应、没有公开视频标记的成功响应、私密/好友可见标记、daemon 校验失败，以及 action 调用后超时都必须失败；不安全调用之后插件不能再尝试另一个发布 action，也不能回退成封面图。
+
+### 2026-06-08 原生视频契约加固
+
+- 修复：daemon 视频校验现在要求正向公开证明（`ugc_right=1`、`visibility=public`、`visible=all`、`right=public` 或 `public=true`）。仅仅缺少私密标记的 feed/detail 不再被接受为公开。
+- 修复补充：`QzoneClient.publish_video_mood()` 继续发送 Web 视频 `richval`，但它只是中间创建步骤。随后 `QzoneClient.update_mood_visibility_public()` 调用 `emotion_cgi_update`，最终成功必须依赖明确公开的 feed/detail 校验。
+
 ## 2026-05-27 实施阶段
 
 ### 本地测试环境没有 quart
