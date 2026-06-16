@@ -17,6 +17,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterable, Iterator
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -596,6 +597,19 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
                 "news_max_post_length",
                 "news_trust_env",
                 "native_video_publish",
+                "life_publish_enabled",
+                "life_publish_use_life_context",
+                "life_publish_use_llm_image_prompt",
+                "life_publish_use_omnidraw_selfie",
+                "life_publish_auto_caption",
+                "life_publish_mode",
+                "life_publish_failure_policy",
+                "life_publish_aspect_ratio",
+                "life_publish_size",
+                "life_publish_extra_params",
+                "life_publish_static_caption",
+                "life_publish_image_prompt_template",
+                "life_publish_caption_prompt",
             )
         },
     }
@@ -768,6 +782,14 @@ import qzone_bridge.selection as _selection
 from qzone_bridge.settings import PluginSettings
 import qzone_bridge.social as _social
 from qzone_bridge.utils import truncate
+
+
+class LifePublishResult(dict):
+    """Publish payload with the rendered source post attached for command feedback."""
+
+    def __init__(self, payload: dict[str, Any], post: PostPayload):
+        super().__init__(payload)
+        self.post = post
 
 
 class _CompatRenderProfile:
@@ -972,6 +994,13 @@ class QzoneStablePlugin(Star):
         self._context = context
         raw_config = config if config is not None else getattr(context, "get_config", lambda: {})()
         self.settings = PluginSettings.from_mapping(raw_config)
+        logger.info(
+            "qzone settings loaded publish_cron=%s life_publish_enabled=%s life_mode=%s life_failure_policy=%s",
+            self.settings.publish_cron,
+            getattr(self.settings, "life_publish_enabled", False),
+            getattr(self.settings, "life_publish_mode", "publish"),
+            getattr(self.settings, "life_publish_failure_policy", "skip"),
+        )
         self.root = Path(__file__).resolve().parent
         self.plugin_name = _read_plugin_name(self.root)
         self.data_dir = _standard_data_dir(self.root)
@@ -1037,6 +1066,46 @@ class QzoneStablePlugin(Star):
     def _command_result(self, event: AstrMessageEvent, text: str):
         self._stop_event(event)
         return event.plain_result(text)
+
+    @staticmethod
+    def _star_instance_from_metadata(metadata: Any) -> Any | None:
+        if metadata is None:
+            return None
+        for attr in ("star_cls", "star", "instance", "plugin", "plugin_instance"):
+            instance = getattr(metadata, attr, None)
+            if instance is not None:
+                return instance
+        return metadata
+
+    def _registered_star_plugin(self, *names: str) -> Any | None:
+        context = getattr(self, "_context", None) or getattr(self, "context", None)
+        getter = getattr(context, "get_registered_star", None)
+        if not callable(getter):
+            return None
+        for name in names:
+            try:
+                metadata = getter(name)
+            except Exception as exc:
+                logger.debug("qzone registered star lookup failed name=%s: %s", name, exc)
+                continue
+            plugin = self._star_instance_from_metadata(metadata)
+            if plugin is not None:
+                return plugin
+        return None
+
+    def _life_scheduler_plugin(self) -> Any | None:
+        return self._registered_star_plugin(
+            "astrbot_plugin_life_scheduler",
+            "life_scheduler",
+            "LifeSchedulerPlugin",
+        )
+
+    def _omnidraw_plugin(self) -> Any | None:
+        return self._registered_star_plugin(
+            "astrbot_plugin_omnidraw",
+            "omnidraw",
+            "OmniDrawPlugin",
+        )
 
     def _post_store(self) -> PostStore:
         expected = self.data_dir / "posts.json"
@@ -1487,6 +1556,65 @@ class QzoneStablePlugin(Star):
             return image_result(str(image_path))
         self._stop_event(event)
         return event.plain_result(f"{text}\n图片路径: {image_path}")
+
+    async def _manual_publish_completion_results(
+        self,
+        event: AstrMessageEvent,
+        post: PostPayload,
+        payload: dict[str, Any],
+        message: str,
+    ) -> list[Any]:
+        settings = getattr(self, "settings", SimpleNamespace())
+        if not getattr(settings, "render_publish_result", True):
+            return [self._command_result(event, message)]
+        try:
+            profile = await self._publisher_render_profile(event, allow_network=False)
+        except Exception:
+            profile = profile_from_event(event)
+        render_post = getattr(payload, "post", None) or post
+        try:
+            image_path = await asyncio.to_thread(
+                _render_publish_result_image,
+                render_post,
+                self.data_dir / "rendered_posts",
+                profile=profile,
+                result=payload,
+                width=int(getattr(settings, "render_result_width", 900) or 900),
+                remote_timeout=float(getattr(settings, "render_remote_timeout", 0.35) or 0.35),
+            )
+        except Exception as exc:
+            logger.exception("qzone manual publish result render failed: %s", exc)
+            return [self._command_result(event, message)]
+        outgoing = [
+            {"type": "text", "data": {"text": f"{message}\n"}},
+            {"type": "image", "data": {"file": self._onebot_file_uri(image_path)}},
+        ]
+        try:
+            bot = self._capture_onebot_sender(event)
+        except Exception as exc:
+            logger.debug("qzone manual publish direct feedback sender lookup failed: %s", exc)
+            bot = None
+        if bot is not None:
+            sent = await self._send_event_outgoing(bot, event, outgoing)
+            if sent:
+                self._stop_event(event)
+                return []
+
+        make_result = getattr(event, "make_result", None)
+        if callable(make_result):
+            try:
+                result = make_result().message(message).file_image(str(image_path))
+                self._stop_event(event)
+                return [result]
+            except Exception as exc:
+                logger.debug("qzone manual publish chain image feedback failed: %s", exc)
+
+        image_result = getattr(event, "image_result", None)
+        if callable(image_result):
+            self._stop_event(event)
+            return [self._command_result(event, message), image_result(str(image_path))]
+        self._stop_event(event)
+        return [event.plain_result(f"{message}\n图片路径: {image_path}")]
 
     def _post_render_limit(self) -> int:
         limit = int(getattr(self.settings, "render_feed_card_limit", 5) or 5)
@@ -3963,6 +4091,455 @@ class QzoneStablePlugin(Star):
         return await self._llm_adapter().generate_reply_text(event, post, comment)
 
     @staticmethod
+    def _life_context_text(life_data: Any) -> str:
+        if not life_data:
+            return "暂无今日生活日程。"
+        if isinstance(life_data, str):
+            return life_data.strip() or "暂无今日生活日程。"
+        if not isinstance(life_data, dict):
+            try:
+                life_data = {
+                    key: getattr(life_data, key)
+                    for key in ("outfit", "schedule", "timeline", "meta")
+                    if getattr(life_data, key, None) not in (None, "", [], {})
+                }
+            except Exception:
+                return str(life_data).strip() or "暂无今日生活日程。"
+
+        lines: list[str] = []
+        meta = life_data.get("meta") if isinstance(life_data.get("meta"), dict) else {}
+        style = str(meta.get("style") or life_data.get("outfit_style") or "").strip()
+        outfit = str(life_data.get("outfit") or "").strip()
+        schedule = str(life_data.get("schedule") or "").strip()
+        if style:
+            lines.append(f"穿搭风格：{style}")
+        if outfit:
+            lines.append(f"今日穿搭：{outfit}")
+        if schedule:
+            lines.append(f"今日日程：{schedule}")
+
+        timeline = life_data.get("timeline")
+        if isinstance(timeline, list) and timeline:
+            timeline_lines: list[str] = []
+            for item in timeline[:8]:
+                if isinstance(item, dict):
+                    time_text = str(item.get("time") or item.get("at") or item.get("start") or "").strip()
+                    content = str(item.get("content") or item.get("activity") or item.get("text") or "").strip()
+                    text = " ".join(part for part in (time_text, content) if part).strip()
+                else:
+                    text = str(item or "").strip()
+                if text:
+                    timeline_lines.append(text)
+            if timeline_lines:
+                lines.append("时间线：" + "；".join(timeline_lines))
+        return "\n".join(lines).strip() or "暂无今日生活日程。"
+
+    async def _get_life_context(self) -> tuple[dict[str, Any], str]:
+        if not getattr(self.settings, "life_publish_use_life_context", True):
+            return {}, "日程上下文开关已关闭。"
+        plugin = self._life_scheduler_plugin()
+        if plugin is None:
+            raise RuntimeError("未找到 Life Scheduler 插件实例")
+        getter = getattr(plugin, "get_life_context", None)
+        if not callable(getter):
+            raise RuntimeError("Life Scheduler 插件未提供 get_life_context()")
+        data = await self._maybe_await(getter())
+        if data is None:
+            data = {}
+        if not isinstance(data, dict):
+            text = self._life_context_text(data)
+            return {"raw": data}, text
+        return data, self._life_context_text(data)
+
+    @staticmethod
+    def _format_life_prompt_template(template: str, *, life_context: str) -> str:
+        try:
+            return template.format(life_context=life_context)
+        except Exception:
+            return f"{template}\n\n{life_context}"
+
+    @staticmethod
+    def _clean_life_publish_text(text: str, *, fallback: str = "") -> str:
+        cleaned = QzoneLLM._clean_generated_text(
+            text,
+            fields=("content", "caption", "prompt", "text", "message", "action"),
+            fallback=fallback,
+        )
+        return cleaned.strip()
+
+    @staticmethod
+    def _fallback_life_image_prompt(life_context: str) -> str:
+        context = QzoneStablePlugin._clean_life_publish_text(life_context) or "今日份日常生活"
+        return f"真实手机自拍，{context}，自然光线，生活感场景，构图自然，画面清晰。"
+
+    async def _generate_life_image_prompt(self, event: AstrMessageEvent | None, life_context: str) -> str:
+        template = str(getattr(self.settings, "life_publish_image_prompt_template", "") or "").strip()
+        prompt = self._format_life_prompt_template(template, life_context=life_context).strip()
+        fallback_prompt = self._fallback_life_image_prompt(life_context)
+        if not prompt:
+            prompt = fallback_prompt
+        if not getattr(self.settings, "life_publish_use_llm_image_prompt", True):
+            return self._clean_life_publish_text(prompt, fallback=fallback_prompt) or fallback_prompt
+        system_prompt = (
+            "你是给 OmniDraw 自拍模式写画面动作/场景提示词的助手。"
+            "只输出最终提示词，不要输出 JSON、解释、标题或编号。"
+            "提示词要适合 generate_selfie：包含动作、场景、穿搭、光线、构图和生活氛围。"
+        )
+        call_event = event or self._scheduled_plugin_event(prompt=prompt)
+        text = await self._llm_adapter().generate_text(
+            call_event,
+            prompt,
+            provider_id=self.settings.post_provider_id,
+            system_prompt=system_prompt,
+            prefer_current_provider=True,
+        )
+        cleaned = self._clean_life_publish_text(text)
+        if cleaned:
+            return cleaned
+        fallback = self._clean_life_publish_text(fallback_prompt, fallback=fallback_prompt) or fallback_prompt
+        logger.debug("qzone life publish image prompt fell back to template prompt")
+        return fallback
+
+    async def _generate_life_caption(
+        self,
+        event: AstrMessageEvent | None,
+        *,
+        life_context: str,
+        image_prompt: str,
+    ) -> str:
+        static_caption = str(getattr(self.settings, "life_publish_static_caption", "") or "").strip()
+        if not getattr(self.settings, "life_publish_auto_caption", True):
+            return static_caption
+        template = str(getattr(self.settings, "life_publish_caption_prompt", "") or "").strip()
+        try:
+            prompt = template.format(life_context=life_context, image_prompt=image_prompt)
+        except Exception:
+            prompt = f"{template}\n\n日程上下文：\n{life_context}\n\n自拍提示词：\n{image_prompt}"
+        system_prompt = (
+            "你是 QQ 空间说说文案助手。只输出最终可发布的简短中文说说，"
+            "不要解释，不要输出 JSON/Markdown/标题，语气自然有生活感。"
+        )
+        text = await self._llm_adapter().generate_text(
+            event,
+            prompt,
+            provider_id=self.settings.post_provider_id,
+            system_prompt=system_prompt,
+            prefer_current_provider=True,
+        )
+        return self._clean_life_publish_text(text, fallback=static_caption) or static_caption
+
+    def _scheduled_plugin_event(self, *, prompt: str = "") -> Any:
+        sender_id = int((self.settings.admin_uins or [0])[0] or 0)
+        group_id = int(getattr(self.settings, "manage_group", 0) or 0)
+        message_text = str(prompt or "").strip()
+        message_obj = SimpleNamespace(
+            message=[],
+            message_str=message_text,
+            sender=SimpleNamespace(user_id=sender_id, nickname="定时自动发布"),
+            group_id=group_id,
+        )
+
+        class _ScheduledEvent:
+            def __init__(self, sender: int, group: int, text: str, obj: Any):
+                self.message_obj = obj
+                self.message_str = text
+                self.sender_id = sender
+                self.user_id = sender
+                self.group_id = group
+                self.unified_msg_origin = f"aiocqhttp:group:{group}" if group else f"aiocqhttp:private:{sender}"
+
+            def get_sender_id(self) -> int:
+                return self.sender_id
+
+            def get_sender_name(self) -> str:
+                return "定时自动发布"
+
+            def get_sender_nickname(self) -> str:
+                return "定时自动发布"
+
+            def get_group_id(self) -> int:
+                return self.group_id
+
+            def get_message_type(self) -> str:
+                return "group" if self.group_id else "private"
+
+            def get_session_id(self) -> str:
+                return self.unified_msg_origin
+
+        return _ScheduledEvent(sender_id, group_id, message_text, message_obj)
+
+    @staticmethod
+    def _parse_omnidraw_result(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            text = raw.strip()
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return {"success": False, "message": text, "images": []}
+            return parsed if isinstance(parsed, dict) else {"success": False, "message": text, "images": []}
+        return {"success": False, "message": str(raw or ""), "images": []}
+
+    @staticmethod
+    def _omnidraw_image_source(image: Any) -> str:
+        if isinstance(image, str):
+            return image.strip()
+        if not isinstance(image, dict):
+            return ""
+        for key in ("file_path", "url", "image_url", "data_url", "source", "path", "file"):
+            value = str(image.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _omnidraw_images_to_media(self, result: dict[str, Any]) -> list[PostMedia]:
+        sources: list[str] = []
+        for item in result.get("images") or []:
+            source = self._omnidraw_image_source(item)
+            if source and source not in sources:
+                sources.append(source)
+        return normalize_media_list(sources, default_kind="image", trusted_local=True)
+
+    @staticmethod
+    def _life_publish_image_retry_count(settings: Any) -> int:
+        try:
+            retry_count = int(getattr(settings, "life_publish_image_retry_count", 1) or 0)
+        except (TypeError, ValueError):
+            retry_count = 1
+        return max(0, min(retry_count, 5))
+
+    async def _call_omnidraw_selfie_return_result(
+        self,
+        method: Any,
+        call_event: Any,
+        image_prompt: str,
+        kwargs: dict[str, Any],
+    ) -> Any:
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            signature = None
+        parameters = signature.parameters if signature is not None else {}
+        accepts_var_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
+        accepts_var_positional = any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in parameters.values())
+        call_args: list[Any] = []
+        call_kwargs: dict[str, Any] = {}
+
+        if "event" in parameters or accepts_var_kwargs:
+            call_kwargs["event"] = call_event
+
+        if "action" in parameters or accepts_var_kwargs:
+            call_kwargs["action"] = image_prompt
+        elif "prompt" in parameters:
+            call_kwargs["prompt"] = image_prompt
+        elif accepts_var_positional:
+            call_args.append(image_prompt)
+
+        for key, value in kwargs.items():
+            if key in {"event", "action", "prompt"}:
+                continue
+            if key in parameters or accepts_var_kwargs:
+                call_kwargs[key] = value
+
+        return await self._maybe_await(method(*call_args, **call_kwargs))
+
+    async def _generate_life_selfie_media(
+        self,
+        event: AstrMessageEvent | None,
+        image_prompt: str,
+    ) -> tuple[list[PostMedia], dict[str, Any]]:
+        if not getattr(self.settings, "life_publish_use_omnidraw_selfie", True):
+            return [], {"success": False, "message": "OmniDraw 自拍开关已关闭", "images": []}
+        plugin = self._omnidraw_plugin()
+        if plugin is None:
+            raise RuntimeError("未找到 OmniDraw 插件实例")
+        method = getattr(plugin, "generate_selfie", None)
+        if not callable(method):
+            method = getattr(plugin, "tool_generate_selfie", None)
+        if not callable(method):
+            raise RuntimeError("OmniDraw 插件未提供 generate_selfie/tool_generate_selfie")
+        call_event = event or self._scheduled_plugin_event(prompt=image_prompt)
+        kwargs = {
+            "action": image_prompt,
+            "count": 1,
+            "aspect_ratio": str(getattr(self.settings, "life_publish_aspect_ratio", "") or ""),
+            "size": str(getattr(self.settings, "life_publish_size", "") or ""),
+            "extra_params": str(getattr(self.settings, "life_publish_extra_params", "") or ""),
+            "return_result": True,
+            "refs": "",
+        }
+        max_retries = self._life_publish_image_retry_count(self.settings)
+        total_attempts = max_retries + 1
+        last_result: dict[str, Any] = {"success": False, "message": "", "images": []}
+        last_exception: Exception | None = None
+        for attempt_index in range(1, total_attempts + 1):
+            try:
+                raw_result = await self._call_omnidraw_selfie_return_result(method, call_event, image_prompt, kwargs)
+                result = self._parse_omnidraw_result(raw_result)
+                media = self._omnidraw_images_to_media(result)
+                if media:
+                    if attempt_index > 1:
+                        logger.info(
+                            "qzone life publish OmniDraw selfie succeeded after retry attempt=%s/%s",
+                            attempt_index,
+                            total_attempts,
+                        )
+                    return media, result
+                message = str(result.get("message") or "OmniDraw 未返回可发布图片").strip()
+                result.setdefault("message", message)
+                last_result = result
+                if attempt_index < total_attempts:
+                    logger.warning(
+                        "qzone life publish OmniDraw selfie returned no image attempt=%s/%s; retrying: %s",
+                        attempt_index,
+                        total_attempts,
+                        message,
+                    )
+            except Exception as exc:
+                last_exception = exc
+                if attempt_index >= total_attempts:
+                    raise
+                logger.warning(
+                    "qzone life publish OmniDraw selfie failed attempt=%s/%s; retrying: %s",
+                    attempt_index,
+                    total_attempts,
+                    exc,
+                )
+            if attempt_index < total_attempts:
+                await asyncio.sleep(min(0.5, 0.1 * attempt_index))
+        if last_exception is not None:
+            raise last_exception
+        return [], last_result
+
+    async def _create_scheduled_draft(self, post: PostPayload, *, message: str) -> DraftPost:
+        draft = await self.drafts.add_async(
+            author_uin=0,
+            author_name="定时自动发布",
+            group_id=0,
+            content=post.content,
+            media=[item.to_dict() for item in post.media],
+            anonymous=False,
+        )
+        if getattr(self.settings, "send_admin", False):
+            bot = self._capture_onebot_client(None)
+            if bot is not None:
+                text = f"{message}\n{draft.preview(include_private=True)}"
+                rendered = await self._render_markdown_image(text, subdir="drafts")
+                outgoing: Any = text
+                if rendered is not None:
+                    outgoing = [
+                        {"type": "text", "data": {"text": f"{message}\n"}},
+                        {"type": "image", "data": {"file": self._onebot_file_uri(rendered)}},
+                    ]
+                await self._send_admin_outgoing(bot, outgoing)
+        return draft
+
+    async def _publish_or_draft_scheduled_post(
+        self,
+        post: PostPayload,
+        *,
+        event: AstrMessageEvent | None = None,
+        force_publish: bool = False,
+        notify_admin: bool = True,
+    ) -> LifePublishResult:
+        mode = str(getattr(self.settings, "life_publish_mode", "publish") or "publish").lower()
+        if mode == "draft" and not force_publish:
+            draft = await self._create_scheduled_draft(post, message="定时生活说说已生成草稿")
+            logger.info("qzone scheduled life publish created draft id=%s text_length=%s", draft.id, len(post.content))
+            return LifePublishResult({"draft_id": draft.id, "mode": "draft", "message": "created draft"}, post)
+        await self._ensure_cookie_ready(event)
+        await self._ensure_daemon()
+        payload = await self.controller.publish_post(
+            content=post.content,
+            media=[item.to_dict() for item in post.media],
+            content_sanitized=True,
+        )
+        logger.info(
+            "qzone scheduled life publish succeeded fid=%s text_length=%s media_count=%s",
+            payload.get("fid") or "",
+            len(post.content),
+            len(post.media),
+        )
+        if notify_admin:
+            await self._notify_admin_publish_result(post, payload, "日常说说发布完成")
+        return LifePublishResult(payload, post)
+
+    async def _auto_life_publish_once(
+        self,
+        event: AstrMessageEvent | None = None,
+        *,
+        force_publish: bool = False,
+        notify_admin: bool = True,
+    ) -> dict[str, Any] | None:
+        logger.info(
+            "qzone scheduled life publish started event=%s force_publish=%s mode=%s failure_policy=%s use_life_context=%s use_llm_image_prompt=%s use_omnidraw_selfie=%s auto_caption=%s image_retry_count=%s",
+            bool(event),
+            force_publish,
+            getattr(self.settings, "life_publish_mode", "publish"),
+            getattr(self.settings, "life_publish_failure_policy", "skip"),
+            getattr(self.settings, "life_publish_use_life_context", True),
+            getattr(self.settings, "life_publish_use_llm_image_prompt", True),
+            getattr(self.settings, "life_publish_use_omnidraw_selfie", True),
+            getattr(self.settings, "life_publish_auto_caption", True),
+            self._life_publish_image_retry_count(self.settings),
+        )
+        life_data: dict[str, Any] = {}
+        try:
+            life_data, life_context = await self._get_life_context()
+        except Exception as exc:
+            if getattr(self.settings, "life_publish_use_life_context", True):
+                logger.warning("qzone scheduled life publish skipped: life context failed: %s", exc)
+                if self.settings.life_publish_failure_policy != "text_only":
+                    return
+            life_context = "暂无今日生活日程。"
+
+        image_prompt = ""
+        media: list[PostMedia] = []
+        omnidraw_result: dict[str, Any] = {"success": False, "images": []}
+        image_flow_failed = False
+        try:
+            image_prompt = await self._generate_life_image_prompt(event, life_context)
+            if not image_prompt.strip():
+                raise RuntimeError("LLM 未生成自拍提示词")
+            media, omnidraw_result = await self._generate_life_selfie_media(event, image_prompt)
+            if not media:
+                raise RuntimeError(str(omnidraw_result.get("message") or "OmniDraw 未返回图片"))
+        except Exception as exc:
+            image_flow_failed = True
+            logger.warning("qzone scheduled life publish image flow failed: %s", exc, exc_info=True)
+            if self.settings.life_publish_failure_policy != "text_only":
+                return
+
+        try:
+            caption = await self._generate_life_caption(event, life_context=life_context, image_prompt=image_prompt)
+        except Exception as exc:
+            logger.warning("qzone scheduled life publish caption failed: %s", exc, exc_info=True)
+            if self.settings.life_publish_failure_policy != "text_only":
+                return
+            caption = str(getattr(self.settings, "life_publish_static_caption", "") or "")
+        if image_flow_failed and not media and not caption.strip():
+            return
+        content = (caption or str(getattr(self.settings, "life_publish_static_caption", "") or "")).strip()
+        if not content:
+            content = "今日份生活碎片。"
+        post = PostPayload(content=content, media=media)
+        payload = await self._publish_or_draft_scheduled_post(
+            post,
+            event=event,
+            force_publish=force_publish,
+            notify_admin=notify_admin,
+        )
+        logger.info(
+            "qzone scheduled life publish finished mode=%s media_count=%s life_keys=%s omnidraw_success=%s",
+            "publish" if force_publish else getattr(self.settings, "life_publish_mode", "publish"),
+            len(media),
+            ",".join(sorted(life_data.keys())) if isinstance(life_data, dict) else "",
+            bool(omnidraw_result.get("success")),
+        )
+        return payload
+
+    @staticmethod
     def _cron_delay_seconds(cron: str, offset_seconds: int) -> float:
         return cron_delay_seconds(cron, offset_seconds, now=datetime.now(), randint=random.randint)
 
@@ -3994,6 +4571,14 @@ class QzoneStablePlugin(Star):
     def _start_scheduled_tasks(self) -> None:
         self._scheduled_tasks = [task for task in self._scheduled_tasks if not task.done()]
         if self.settings.publish_cron:
+            logger.info(
+                "qzone scheduled publish configured cron=%s offset=%s life_publish_enabled=%s life_mode=%s life_failure_policy=%s",
+                self.settings.publish_cron,
+                self.settings.publish_offset,
+                getattr(self.settings, "life_publish_enabled", False),
+                getattr(self.settings, "life_publish_mode", "publish"),
+                getattr(self.settings, "life_publish_failure_policy", "skip"),
+            )
             self._create_scheduled_task(
                 "publish",
                 self.settings.publish_cron,
@@ -4033,7 +4618,12 @@ class QzoneStablePlugin(Star):
                 logger.warning("qzone scheduled %s failed: %s", name, exc)
 
     async def _auto_publish_once(self) -> None:
-        logger.info("qzone scheduled publish started")
+        life_enabled = getattr(self.settings, "life_publish_enabled", False)
+        logger.info("qzone scheduled publish started life_publish_enabled=%s", life_enabled)
+        if life_enabled:
+            logger.info("qzone scheduled publish routed to life flow")
+            await self._auto_life_publish_once()
+            return
         fake_event = None
         text = await self._generate_post_text(fake_event, "")  # type: ignore[arg-type]
         if not text.strip():
@@ -4995,6 +5585,32 @@ class QzoneStablePlugin(Star):
             yield self._command_result(event, self._error_text(exc))
             return
         yield await self._publish_result(event, post, payload, profile_task=profile_task)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("发日常说说")
+    async def publish_life_feed_auto(self, event: AstrMessageEvent):
+        """立即执行“日程上下文 -> LLM 自拍提示词 -> OmniDraw 自拍 -> QQ 空间发布”的完整链路。"""
+        self._stop_event(event)
+        try:
+            payload = await self._auto_life_publish_once(event, force_publish=True, notify_admin=False)
+        except QzoneBridgeError as exc:
+            yield self._command_result(event, self._error_text(exc))
+            return
+        except Exception as exc:
+            logger.warning("qzone manual life publish failed: %s", exc, exc_info=True)
+            yield self._command_result(event, f"日常说说发布失败：{exc}")
+            return
+        if not payload:
+            yield self._command_result(
+                event,
+                "日常说说发布已跳过：请检查 Life Scheduler、OmniDraw、LLM 配置，或将失败策略改为 text_only。",
+            )
+            return
+        post = getattr(payload, "post", None)
+        if not isinstance(post, PostPayload):
+            post = PostPayload(content="", media=[])
+        for result in await self._manual_publish_completion_results(event, post, payload, "日常说说发布完成"):
+            yield result
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("写说说", alias={"写稿"})

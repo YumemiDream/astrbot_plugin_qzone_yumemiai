@@ -68,6 +68,7 @@ pip install -r requirements.txt
 | 评说说 | 评论说说 | 管理员 | `评说说 [@用户/QQ] [序号/范围] [评论内容]` | 评论说说并返回原文与评论分区展示的渲染卡片；内容为空时由 AI 生成，空参数会跳过自己和已评论过的说说 |
 | 赞说说 | - | 管理员 | `赞说说 [@用户/QQ] [序号/范围]` | 点赞说说 |
 | 发说说 | - | 管理员 | `发说说 <文本> [图片/视频]` | 立即发布说说；单视频优先走 daemon 原生视频后台直发，缺少上传材料时阻止发布并提示绑定 |
+| 发日常说说 | - | 管理员 | `发日常说说` | 立即执行 Life Scheduler 日程、LLM 自拍提示词、OmniDraw 自拍图、QQ 空间发布完整链路 |
 | 写说说 | 写稿 | 管理员 | `写说说 <主题> [图片/视频]` | 生成待审核或待发布文案 |
 | 新闻说说 获取 | 获取新闻、新闻列表 | 管理员 | `新闻说说 获取 [数量] [中国/国际/混合]` | 从 Google News RSS 拉取指定数量候选新闻，按发布时间排序并缓存 |
 | 新闻说说 预览 | 新闻说说预览 | 管理员 | `新闻说说 预览 [序号/中国/国际/混合]` | 预览 LLM 基于候选新闻生成的原创说说，不发布 |
@@ -184,3 +185,32 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 - 图片/视频发布失败：确认图片或引用的视频可被 AstrBot 正常读取；视频会优先使用 OneBot 返回的 `url/download_url/file_url/path/file_id`，再尝试 `get_file`、群/私聊文件直链和 base64 兜底；封面提取依赖系统 `ffmpeg` 或 `imageio-ffmpeg`。
 - LLM 生成内容为空：检查 AstrBot 当前会话 provider，或分别配置 `llm.post_provider_id`、`llm.comment_provider_id`、`llm.reply_provider_id`。
 - 点赞成功但提示校验不确定：通常是 QQ 空间读回延迟，可稍后再查看目标说说。
+
+
+## 定时生活说说联动（Life Scheduler + OmniDraw）
+
+开启后，`trigger.publish_cron` 触发时会先走这条链路：
+
+1. 调用 `astrbot_plugin_life_scheduler.get_life_context()` 获取今日日程
+2. 把日程交给 LLM 生成适合 OmniDraw 自拍模式的提示词
+3. 调用 OmniDraw 的 `generate_selfie(return_result=true)` 获取返回式图片
+4. 自动配文并发说说，或按配置写入草稿
+
+推荐配置：
+
+- `life_publish.enabled=true`
+- `life_publish.use_life_context=true`
+- `life_publish.use_llm_image_prompt=true`
+- `life_publish.use_omnidraw_selfie=true`
+- `life_publish.auto_caption=true`
+- `life_publish.mode=publish` 或 `draft`
+- `life_publish.failure_policy=skip` 或 `text_only`
+- `life_publish.image_retry_count=1`（生图失败后的额外重试次数，0=不重试，最大 5）
+
+说明：
+
+- 这里不会调用 OmniDraw 的自动下发路径，只使用 `return_result=true` 取回图片结果。
+- 如果 Life Scheduler 或 OmniDraw 不可用，会按 `failure_policy` 处理。
+- OmniDraw 未返回图片或调用抛错时，会按 `life_publish.image_retry_count` 重试，每次仍强制传 `return_result=true`。
+- 关闭 `life_publish.enabled` 后，`trigger.publish_cron` 会退回原来的纯文本定时发说说。
+- 管理员可发送 `发日常说说` 立即跑完整链路并直接发布；该指令会沿用各项日程/LLM/OmniDraw 开关，但会强制发布，不受 `life_publish.mode=draft` 影响。

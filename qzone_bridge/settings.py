@@ -12,6 +12,7 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/122.0.0.0 Safari/537.36"
 )
+DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT = 1
 
 
 def _as_mapping(config: Any) -> dict[str, Any]:
@@ -79,6 +80,11 @@ def _as_bool(value: Any, default: bool) -> bool:
         if text in {"0", "false", "no", "n", "off"}:
             return False
     return bool(value)
+
+
+def _choice(value: Any, default: str, allowed: set[str]) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in allowed else default
 
 
 def _as_int(value: Any, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
@@ -164,6 +170,29 @@ class PluginSettings:
     read_prob: float = 0.0
     send_admin: bool = False
     like_when_comment: bool = False
+    life_publish_enabled: bool = False
+    life_publish_use_life_context: bool = True
+    life_publish_use_llm_image_prompt: bool = True
+    life_publish_use_omnidraw_selfie: bool = True
+    life_publish_auto_caption: bool = True
+    life_publish_mode: str = "publish"
+    life_publish_failure_policy: str = "skip"
+    life_publish_aspect_ratio: str = "1:1"
+    life_publish_size: str = ""
+    life_publish_extra_params: str = ""
+    life_publish_image_retry_count: int = DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT
+    life_publish_static_caption: str = "今日份生活碎片。"
+    life_publish_image_prompt_template: str = (
+        "根据今日日程和穿搭，写一段适合 OmniDraw 自拍模式的生图提示词。"
+        "画面要像真实手机自拍或日常随手拍，包含场景、动作、服装、光线和氛围。\n\n"
+        "{life_context}"
+    )
+    life_publish_caption_prompt: str = (
+        "根据今日日程和自拍画面，写一条适合 QQ 空间发布的简短说说。"
+        "自然、有生活感，不要解释。\n\n"
+        "日程上下文：\n{life_context}\n\n"
+        "自拍提示词：\n{image_prompt}"
+    )
     news_scopes: list[str] = field(default_factory=lambda: ["china"])
     news_keywords: list[str] = field(default_factory=list)
     news_custom_rss_urls: list[str] = field(default_factory=list)
@@ -219,7 +248,7 @@ class PluginSettings:
             comment_reasoning_provider_id=str(_nested(mapping, "llm", "comment_reasoning_provider_id", "") or ""),
             comment_execution_provider_id=str(_nested(mapping, "llm", "comment_execution_provider_id", "") or ""),
             comment_skip_checkins=_as_bool(_nested(mapping, "llm", "comment_skip_checkins", True), True),
-            comment_max_length=int(_nested(mapping, "llm", "comment_max_length", 60) or 60),
+            comment_max_length=_as_int(_nested(mapping, "llm", "comment_max_length", 60), 60, minimum=1),
             reply_provider_id=str(_nested(mapping, "llm", "reply_provider_id", "") or ""),
             reply_prompt=str(_nested(mapping, "llm", "reply_prompt", cls.reply_prompt) or cls.reply_prompt),
             news_provider_id=str(
@@ -272,6 +301,64 @@ class PluginSettings:
             read_prob=_as_float(_nested(mapping, "trigger", "read_prob", 0.0), 0.0, minimum=0.0, maximum=1.0),
             send_admin=_as_bool(_nested(mapping, "trigger", "send_admin", False), False),
             like_when_comment=_as_bool(_nested(mapping, "trigger", "like_when_comment", False), False),
+            life_publish_enabled=_as_bool(_nested(mapping, "life_publish", "enabled", False), False),
+            life_publish_use_life_context=_as_bool(
+                _nested(mapping, "life_publish", "use_life_context", True),
+                True,
+            ),
+            life_publish_use_llm_image_prompt=_as_bool(
+                _nested(mapping, "life_publish", "use_llm_image_prompt", True),
+                True,
+            ),
+            life_publish_use_omnidraw_selfie=_as_bool(
+                _nested(mapping, "life_publish", "use_omnidraw_selfie", True),
+                True,
+            ),
+            life_publish_auto_caption=_as_bool(
+                _nested(mapping, "life_publish", "auto_caption", True),
+                True,
+            ),
+            life_publish_mode=_choice(
+                _nested(mapping, "life_publish", "mode", "publish"),
+                "publish",
+                {"publish", "draft"},
+            ),
+            life_publish_failure_policy=_choice(
+                _nested(mapping, "life_publish", "failure_policy", "skip"),
+                "skip",
+                {"skip", "text_only"},
+            ),
+            life_publish_aspect_ratio=str(_nested(mapping, "life_publish", "aspect_ratio", "1:1") or "1:1"),
+            life_publish_size=str(_nested(mapping, "life_publish", "size", "") or ""),
+            life_publish_extra_params=str(_nested(mapping, "life_publish", "extra_params", "") or ""),
+            life_publish_image_retry_count=_as_int(
+                _nested(
+                    mapping,
+                    "life_publish",
+                    "image_retry_count",
+                    DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT,
+                ),
+                DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT,
+                minimum=0,
+                maximum=5,
+            ),
+            life_publish_static_caption=str(
+                _nested(mapping, "life_publish", "static_caption", cls.life_publish_static_caption)
+                or cls.life_publish_static_caption
+            ),
+            life_publish_image_prompt_template=str(
+                _nested(
+                    mapping,
+                    "life_publish",
+                    "image_prompt_template",
+                    cls.life_publish_image_prompt_template,
+                )
+                or cls.life_publish_image_prompt_template
+            ),
+            life_publish_caption_prompt=str(
+                _nested(mapping, "life_publish", "caption_prompt", cls.life_publish_caption_prompt)
+                or cls.life_publish_caption_prompt
+            ),
             news_scopes=normalize_news_scopes(_nested(mapping, "news", "scopes", ["china"])),
             news_keywords=[str(item).strip() for item in _as_list(_nested(mapping, "news", "keywords", [])) if str(item).strip()],
             news_custom_rss_urls=[
