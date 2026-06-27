@@ -4250,6 +4250,16 @@ class QzoneStablePlugin(Star):
             get_name = getattr(task, "get_name", None)
             if callable(get_name) and get_name() == label:
                 return True
+        try:
+            loop = asyncio.get_running_loop()
+            for task in asyncio.all_tasks(loop):
+                if task.done():
+                    continue
+                get_name = getattr(task, "get_name", None)
+                if callable(get_name) and get_name() == label:
+                    return True
+        except RuntimeError:
+            pass
         return False
 
     def _create_scheduled_task(self, name: str, cron: str, offset: int, action: Any) -> None:
