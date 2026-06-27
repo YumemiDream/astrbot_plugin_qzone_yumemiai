@@ -20,11 +20,7 @@ The text and media the user wants to publish as a QQ Space post after wake words
 
 ### Draft
 
-A publishable post saved before it is sent to QQ Space. Drafts are used for AI-written posts and submission review flows.
-
-### Submission
-
-A draft sent by a non-admin user for admin review before publication.
+A publishable post saved before it is sent to QQ Space. Drafts are used for AI-written posts.
 
 ### Login State
 

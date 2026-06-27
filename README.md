@@ -29,10 +29,8 @@ QzoneUltra 现在可以把 **Life Scheduler 日程插件** 和 **OmniDraw 自拍
 - AI 写说说、AI 评论、AI 回评，生成内容会走当前 AstrBot 会话 provider 和人设。
 - 支持文本、图片和单个本地视频发布；视频会交给本地 daemon 走 QQ 空间 Web Cookie/`p_skey` 的 H5 `video_qzone` + `pic_qzone` 链路，先绑定公开相册并创建 `appid=311` 视频说说，再调用权限更新接口做公开修复，最后通过 feed/detail 校验同一 `sVid` 和全部人可见后才返回成功。不会再唤起 QQ/QQNT 客户端、调用 OneBot 端发布 action、要求 QQ upload A2/vLoginData，或退回成视频封面图发布。
 - 看说说、读说说、评论说说、点赞说说和自动评论反馈可复用同款 QQ 空间风格说说卡片渲染。
-- 表白墙投稿、匿名投稿、撤稿、看稿、过稿、拒稿。
 - 定时自动发说说、自动评论好友最新动态，并记录已处理动态，避免重复打扰；其中自动发说说可联动 Life Scheduler + OmniDraw，把今日行程生成自拍图和日常文案后自动发布。
 - 收到消息概率触发自动评论时，会在当前触发会话返回包含原说说和自己评论的 QQ 空间风格渲染图。
-- Google News RSS 新闻说说：可按数量获取候选新闻并排序缓存，也可选择序号让 LLM 写成原创短评后立即发布或定时发布。
 - 可选 pillowmd 风格渲染；渲染失败时自动回退文本。
 - LLM tool 结果会转成自然语言回复，避免向用户暴露 raw JSON、fid、cursor 等内部字段。
 
@@ -86,17 +84,8 @@ pip install -r requirements.txt
 | 发说说 | - | 管理员 | `发说说 <文本> [图片/视频]` | 立即发布说说；单视频优先走 daemon 原生视频后台直发，缺少上传材料时阻止发布并提示绑定 |
 | 发日常说说 | - | 管理员 | `发日常说说` | 立即执行 Life Scheduler 日程、LLM 自拍提示词、OmniDraw 自拍图、QQ 空间发布完整链路 |
 | 写说说 | 写稿 | 管理员 | `写说说 <主题> [图片/视频]` | 生成待审核或待发布文案 |
-| 新闻说说 获取 | 获取新闻、新闻列表 | 管理员 | `新闻说说 获取 [数量] [中国/国际/混合]` | 从 Google News RSS 拉取指定数量候选新闻，按发布时间排序并缓存 |
-| 新闻说说 预览 | 新闻说说预览 | 管理员 | `新闻说说 预览 [序号/中国/国际/混合]` | 预览 LLM 基于候选新闻生成的原创说说，不发布 |
-| 新闻说说 发布 | 发布新闻说说、发新闻说说 | 管理员 | `新闻说说 发布 <序号>` | 选择已缓存候选新闻，让 LLM 生成原创说说并立即发布 |
 | 删说说 | - | 管理员 | `删说说 <序号>` | 删除自己发布的说说 |
 | 回评 | 回复评论 | 管理员 | `回评 <稿件ID> [评论序号]` | 回复已缓存稿件或已发布说说下的评论 |
-| 投稿 | - | 所有人 | `投稿 <文本> [图片/视频]` | 投稿到表白墙 |
-| 匿名投稿 | - | 所有人 | `匿名投稿 <文本> [图片/视频]` | 匿名投稿到表白墙 |
-| 撤稿 | - | 所有人 | `撤稿 <稿件ID>` | 撤回自己的待审核投稿 |
-| 看稿 | 查看稿件 | 管理员 | `看稿 [稿件ID]` | 查看待审核稿件 |
-| 过稿 | 通过稿件、通过投稿 | 管理员 | `过稿 <稿件ID>` | 审核并发布稿件 |
-| 拒稿 | 拒绝稿件、拒绝投稿 | 管理员 | `拒稿 <稿件ID> [原因]` | 拒绝稿件 |
 
 保留的兼容命令：
 
@@ -115,7 +104,7 @@ pip install -r requirements.txt
 /qzone like <hostuin> <fid> [appid] [unlike]
 ```
 
-会读取或改变已绑定 QQ 空间状态的兼容命令只允许管理员使用；普通用户仍可使用投稿、匿名投稿和撤回自己的待审核投稿。
+会读取或改变已绑定 QQ 空间状态的兼容命令只允许管理员使用。
 
 ## LLM 工具
 
@@ -152,28 +141,19 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 | `daemon_port` | `18999` | 本地 daemon 端口；不建议修改，需在防火墙或安全软件中放行 |
 | `auto_start_daemon` | `true` | 首次使用时自动启动 daemon |
 | `auto_bind_cookie` | `true` | 登录态缺失时尝试从 OneBot 自动获取 Cookie |
-| `manage_group` | 空 | 投稿审核通知群；为空时尝试私发管理员 |
+| `manage_group` | 空 | 管理通知群；为空时尝试私发管理员 |
 | `pillowmd_style_dir` | 空 | 可选 pillowmd 样式目录 |
 | `native_video_publish` | `true` | 单个本地视频说说优先交给 daemon 原生视频后台直发；关闭后会拒绝视频发布，避免误把封面/渲染图当作成功 |
 | `render_publish_result` | `true` | 发布成功后返回渲染图；看/读/评/赞说说也会复用同款卡片渲染 |
 | `render_feed_card_limit` | `5` | 看/读/评/赞说说时单次最多渲染的卡片数量；多条会合成一张左对齐长图 |
 | `llm.post_provider_id` | 空 | 写说说使用的 LLM provider；空表示当前会话默认 provider |
-| `llm.news_provider_id` | 空 | 新闻说说使用的 LLM provider；空时优先回退写说说 provider |
 | `llm.comment_provider_id` | 空 | 评论使用的 LLM provider |
 | `llm.reply_provider_id` | 空 | 回评使用的 LLM provider |
 | `trigger.publish_cron` | 空 | 自动发说说 cron 表达式；空表示关闭 |
-| `trigger.news_cron` | 空 | Google News RSS 新闻自动发说说 cron 表达式；空表示关闭 |
 | `trigger.comment_cron` | 空 | 自动评论 cron 表达式；空表示关闭 |
 | `trigger.comment_latest_count` | `1` | 每次定时自动评论从好友最新动态中处理的未评论说说条数 |
-
 | `trigger.read_prob` | `0.0` | 收到消息时概率触发读说说和自动评论 |
 | `trigger.send_admin` | `false` | 定时发布、定时评论后向管理群或管理员私聊发送结果和渲染图；收到消息概率触发的自动评论会发回当前会话 |
-| `news.scopes` | `["china"]` | 新闻范围，可填 `china`、`world`、`mixed`，也支持 `中国`、`国际`、`混合` |
-| `news.keywords` | 空 | 额外 Google News RSS 搜索关键词列表 |
-| `news.custom_rss_urls` | 空 | 自定义 Google News RSS 地址列表，仅允许 `https://news.google.com/rss...` |
-| `news.max_candidates` | `12` | 默认获取或交给 LLM 的新闻候选数量；命令里可临时覆盖 |
-| `news.once_per_day` | `true` | 定时任务每天最多成功发布一次新闻说说；手动选择发布不受该限制 |
-| `news.trust_env` | `true` | Google News RSS 请求使用系统代理；只影响新闻 RSS，不影响 QQ 空间 Cookie 请求 |
 
 `native_video_publish` 开启后，单个本地视频会通过已验证的 daemon 后台路径发布。只要 QQ 空间 Web Cookie/`p_skey` 可用，daemon 会使用 H5 `sliceUpload/FileUploadVideo` 上传视频和封面，确保封面绑定真实公开相册，调用 `emotion_cgi_publish_v6` 创建 `appid=311` 视频说说，保留发现到的 `tid/fid`，再调用 `emotion_cgi_update` 写入 `ugc_right=1`/`who=1` 做幂等公开修复。只有最终 feed/detail 同时验证到 `appid=311`、同一 `sVid` 和明确全部人可见标记时，插件才报告发布成功；不会使用视频封面图、OneBot 协议端发布 action、Tencent upload A2/vLoginData 或 QQ/QQNT 界面作为回退。
 
@@ -187,9 +167,7 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 
 - Cookie 和登录状态。
 - daemon 状态和保活信息。
-- 投稿草稿、稿件 ID、已发布 fid。
 - 自动评论去重记录。
-- 新闻候选缓存、自动发布日期和已使用新闻候选记录。
 - 渲染临时文件和发布结果图。
 
 ## 排障

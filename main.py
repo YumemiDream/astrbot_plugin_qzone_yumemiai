@@ -523,7 +523,6 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
 
     contract_methods = {
         "qzone_bridge.drafts": {"DraftStore": ("add_async", "get_async", "list_async", "update_async")},
-        "qzone_bridge.llm": {"QzoneLLM": ("generate_news_post_text",)},
         "qzone_bridge.posts": {"PostStore": ("get_async", "list_async", "upsert_async")},
         "qzone_bridge.settings": {"PluginSettings": ("from_mapping",)},
         "qzone_bridge.json_store": {"AtomicItemStoreFile": ("read_async", "write_async", "transact_async")},
@@ -584,18 +583,6 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
     contract_dataclass_fields = {
         "qzone_bridge.settings": {
             "PluginSettings": (
-                "news_cron",
-                "news_offset",
-                "news_provider_id",
-                "news_prompt",
-                "news_scopes",
-                "news_keywords",
-                "news_custom_rss_urls",
-                "news_max_candidates",
-                "news_recency_hours",
-                "news_once_per_day",
-                "news_max_post_length",
-                "news_trust_env",
                 "native_video_publish",
                 "life_publish_enabled",
                 "life_publish_use_life_context",
@@ -743,15 +730,6 @@ from qzone_bridge.media import (
     source_name,
 )
 from qzone_bridge.models import FeedEntry
-from qzone_bridge.news import (
-    GoogleNewsRSSClient,
-    NewsItem,
-    filter_recent_news,
-    google_news_rss_urls,
-    is_news_copy_like,
-    merge_news_items,
-    normalize_news_scopes,
-)
 from qzone_bridge.onebot_cookie import (
     COOKIE_ACTIONS,
     ONEBOT_ACTION_CALLER_ATTRS,
@@ -2869,16 +2847,6 @@ class QzoneStablePlugin(Star):
             lines.append(f"{index}. {name} {uin}".strip())
         return "\n".join(lines)
 
-    def _draft_id_from_event(self, event: AstrMessageEvent, names: tuple[str, ...]) -> tuple[int, str]:
-        raw = self._message_after_command(self._event_text(event), names)
-        parts = raw.split(maxsplit=1)
-        if not parts:
-            return 0, ""
-        try:
-            return int(parts[0]), parts[1] if len(parts) > 1 else ""
-        except ValueError:
-            return 0, raw
-
     @staticmethod
     def _onebot_data_payload(payload: Any) -> Any:
         if isinstance(payload, dict) and payload.get("data") not in (None, ""):
@@ -3650,29 +3618,6 @@ class QzoneStablePlugin(Star):
         except Exception as exc:
             logger.debug("qzone draft review notification failed: %s", exc)
 
-    async def _notify_draft_author(self, event: AstrMessageEvent, draft: DraftPost, message: str) -> None:
-        bot = self._capture_onebot_sender(event)
-        if bot is None or not draft.author_uin:
-            return
-        try:
-            if draft.group_id and hasattr(bot, "send_group_msg"):
-                result = bot.send_group_msg(group_id=draft.group_id, message=message)
-            elif hasattr(bot, "send_private_msg"):
-                result = bot.send_private_msg(user_id=draft.author_uin, message=message)
-            else:
-                return
-            await self._maybe_await(result)
-        except Exception as exc:
-            logger.debug("qzone draft author notification failed: %s", exc)
-
-    def _draft_publish_content(self, draft: DraftPost) -> str:
-        content = draft.content.strip()
-        if not self.settings.show_name:
-            return content
-        name = "匿名者" if draft.anonymous else (draft.author_name or str(draft.author_uin or "未知用户"))
-        header = f"【来自 {name} 的投稿】"
-        return "\n\n".join(part for part in (header, content) if part)
-
     def _auto_comment_state_path(self) -> Path:
         return self.data_dir / "auto_comment_state.json"
 
@@ -3687,256 +3632,6 @@ class QzoneStablePlugin(Star):
 
     def _auto_comment_key(self, post: QzonePost | FeedEntry) -> str:
         return f"{int(getattr(post, 'hostuin', 0) or 0)}:{getattr(post, 'fid', '')}"
-
-    def _news_publish_state_path(self) -> Path:
-        return self.data_dir / "news_publish_state.json"
-
-    def _news_candidates_cache_path(self) -> Path:
-        return self.data_dir / "news_candidates.json"
-
-    def _load_news_publish_state(self) -> dict[str, Any]:
-        path = self._news_publish_state_path()
-        if not path.exists():
-            return {"published": []}
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {"published": []}
-        if not isinstance(payload, dict):
-            return {"published": []}
-        published = payload.get("published")
-        if not isinstance(published, list):
-            payload["published"] = []
-        return payload
-
-    def _save_news_publish_state(self, payload: dict[str, Any]) -> None:
-        path = self._news_publish_state_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        items = [item for item in payload.get("published") or [] if isinstance(item, dict)]
-        payload["published"] = items[-500:]
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-    @staticmethod
-    def _news_item_from_dict(payload: Any) -> NewsItem | None:
-        if not isinstance(payload, dict):
-            return None
-        title = str(payload.get("title") or "").strip()
-        if not title:
-            return None
-        try:
-            published_at = int(payload.get("published_at") or 0)
-        except (TypeError, ValueError):
-            published_at = 0
-        return NewsItem(
-            title=title,
-            source=str(payload.get("source") or ""),
-            link=str(payload.get("link") or ""),
-            published_at=published_at,
-            scope=str(payload.get("scope") or ""),
-            item_id=str(payload.get("item_id") or ""),
-        )
-
-    def _save_news_candidates_cache(self, items: list[NewsItem], *, scope_text: str = "", requested_limit: int = 0) -> None:
-        path = self._news_candidates_cache_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "generated_at": datetime.now().isoformat(),
-            "scope": str(scope_text or ""),
-            "requested_limit": int(requested_limit or 0),
-            "items": [item.to_dict() for item in items],
-        }
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-    def _load_news_candidates_cache(self) -> tuple[list[NewsItem], dict[str, Any]]:
-        path = self._news_candidates_cache_path()
-        if not path.exists():
-            return [], {}
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return [], {}
-        if not isinstance(payload, dict):
-            return [], {}
-        items: list[NewsItem] = []
-        for raw_item in payload.get("items") or []:
-            item = self._news_item_from_dict(raw_item)
-            if item is not None:
-                items.append(item)
-        return items, payload
-
-    @staticmethod
-    def _news_today_key() -> str:
-        return datetime.now().date().isoformat()
-
-    def _news_published_ids(self, state: dict[str, Any]) -> set[str]:
-        ids: set[str] = set()
-        for item in state.get("published") or []:
-            if not isinstance(item, dict):
-                continue
-            ids.update(str(value) for value in item.get("candidate_ids") or [] if value)
-            if item.get("id"):
-                ids.add(str(item["id"]))
-        return ids
-
-    def _news_scope_values(self, scope_override: str = "") -> list[str]:
-        if str(scope_override or "").strip():
-            return normalize_news_scopes(scope_override)
-        return list(getattr(self.settings, "news_scopes", None) or ["china"])
-
-    @staticmethod
-    def _news_candidate_limit(value: int | None = None, *, default: int = 12) -> int:
-        try:
-            raw = int(value if value is not None else default)
-        except (TypeError, ValueError):
-            raw = default
-        return max(1, min(raw, 50))
-
-    async def _news_candidates(
-        self,
-        *,
-        scope_override: str = "",
-        seen_ids: set[str] | None = None,
-        limit: int | None = None,
-    ) -> list[NewsItem]:
-        effective_limit = self._news_candidate_limit(
-            limit,
-            default=int(getattr(self.settings, "news_max_candidates", 12) or 12),
-        )
-        urls = google_news_rss_urls(
-            scopes=self._news_scope_values(scope_override),
-            keywords=list(getattr(self.settings, "news_keywords", []) or []),
-            custom_urls=list(getattr(self.settings, "news_custom_rss_urls", []) or []),
-        )
-        client = GoogleNewsRSSClient(
-            timeout=float(getattr(self.settings, "request_timeout", 15.0) or 15.0),
-            user_agent=str(getattr(self.settings, "user_agent", "") or ""),
-            trust_env=bool(getattr(self.settings, "news_trust_env", True)),
-        )
-        items = await client.fetch_items(urls)
-        recent = filter_recent_news(items, recency_hours=int(getattr(self.settings, "news_recency_hours", 36) or 36))
-        return merge_news_items(
-            recent,
-            limit=effective_limit,
-            seen_ids=seen_ids or set(),
-        )
-
-    async def _generate_news_post_text(self, event: AstrMessageEvent | None, items: list[NewsItem]) -> str:
-        return await self._llm_adapter().generate_news_post_text(event, items)
-
-    async def _generate_original_news_post_text(
-        self,
-        event: AstrMessageEvent | None,
-        items: list[NewsItem],
-    ) -> str:
-        for attempt in range(2):
-            text = (await self._generate_news_post_text(event, items)).strip()
-            if not text:
-                return ""
-            if not is_news_copy_like(text, items):
-                return text
-            logger.warning("qzone news publish generated copy-like text on attempt %s; retrying", attempt + 1)
-        return ""
-
-    @staticmethod
-    def _news_items_summary(items: list[NewsItem], *, limit: int = 3) -> str:
-        lines: list[str] = []
-        for item in items[:limit]:
-            source = f" - {item.source}" if item.source else ""
-            lines.append(f"- {truncate(item.title, 80)}{source}")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _news_item_time_text(item: NewsItem) -> str:
-        if not item.published_at:
-            return ""
-        try:
-            return datetime.fromtimestamp(item.published_at).strftime("%Y-%m-%d %H:%M")
-        except (OverflowError, OSError, ValueError):
-            return ""
-
-    def _format_news_candidates(
-        self,
-        items: list[NewsItem],
-        *,
-        title: str = "新闻候选列表",
-        cache_info: dict[str, Any] | None = None,
-    ) -> str:
-        lines = [f"{title}（按发布时间从新到旧排序）"]
-        generated_at = str((cache_info or {}).get("generated_at") or "").strip()
-        if generated_at:
-            lines.append(f"生成时间：{generated_at[:19].replace('T', ' ')}")
-        for index, item in enumerate(items, start=1):
-            meta: list[str] = []
-            if item.source:
-                meta.append(f"来源：{item.source}")
-            time_text = self._news_item_time_text(item)
-            if time_text:
-                meta.append(f"时间：{time_text}")
-            if item.scope:
-                meta.append(f"范围：{item.scope}")
-            suffix = f"\n   {'；'.join(meta)}" if meta else ""
-            lines.append(f"{index}. {truncate(item.title, 90)}{suffix}")
-        lines.append("")
-        lines.append("发布：新闻说说 发布 <序号>；预览：新闻说说 预览 <序号>")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _parse_news_fetch_args(text: str, *, default_limit: int = 12) -> tuple[int, str]:
-        raw = str(text or "").strip()
-        limit = default_limit
-        match = re.search(r"\d+", raw)
-        if match:
-            limit = int(match.group(0))
-            raw = (raw[: match.start()] + " " + raw[match.end() :]).strip()
-        scope_text = re.sub(r"\s+", " ", raw).strip()
-        return QzoneStablePlugin._news_candidate_limit(limit, default=default_limit), scope_text
-
-    @staticmethod
-    def _parse_news_selection(text: str, *, default: int = 1) -> int:
-        match = re.search(r"-?\d+", str(text or ""))
-        if not match:
-            return default
-        try:
-            return int(match.group(0))
-        except ValueError:
-            return default
-
-    @staticmethod
-    def _selected_news_items(items: list[NewsItem], index: int) -> list[NewsItem]:
-        if not items:
-            return []
-        if index < 0:
-            index = len(items) + index + 1
-        if index < 1 or index > len(items):
-            return []
-        return [items[index - 1]]
-
-    def _record_news_publish(
-        self,
-        state: dict[str, Any],
-        *,
-        items: list[NewsItem],
-        post: PostPayload,
-        payload: dict[str, Any],
-    ) -> None:
-        today = self._news_today_key()
-        published = [item for item in state.get("published") or [] if isinstance(item, dict)]
-        primary = items[0] if items else NewsItem(title="")
-        published.append(
-            {
-                "date": today,
-                "id": primary.item_id,
-                "candidate_ids": [item.item_id for item in items if item.item_id],
-                "title": primary.title,
-                "source": primary.source,
-                "fid": str(payload.get("fid") or ""),
-                "content": truncate(post.content, 220),
-                "published_at": datetime.now().isoformat(),
-            }
-        )
-        state["last_date"] = today
-        state["published"] = published
-        self._save_news_publish_state(state)
 
     async def _chat_history_context(self, event: AstrMessageEvent | None = None) -> str:
         bot = self._capture_onebot_client(event)
@@ -4585,13 +4280,6 @@ class QzoneStablePlugin(Star):
                 self.settings.publish_offset,
                 self._auto_publish_once,
             )
-        if getattr(self.settings, "news_cron", ""):
-            self._create_scheduled_task(
-                "news",
-                self.settings.news_cron,
-                self.settings.news_offset,
-                self._auto_news_publish_once,
-            )
         if self.settings.comment_cron:
             self._create_scheduled_task(
                 "comment",
@@ -4639,41 +4327,6 @@ class QzoneStablePlugin(Star):
             len(post.content),
         )
         await self._notify_admin_publish_result(post, payload, "定时自动发布完成")
-
-    async def _auto_news_publish_once(self) -> None:
-        logger.info("qzone scheduled news publish started")
-        state = self._load_news_publish_state()
-        today = self._news_today_key()
-        if bool(getattr(self.settings, "news_once_per_day", True)) and state.get("last_date") == today:
-            logger.info("qzone scheduled news publish skipped: already published today")
-            return
-
-        items = await self._news_candidates(seen_ids=self._news_published_ids(state))
-        if not items:
-            logger.info("qzone scheduled news publish skipped: no fresh news candidates")
-            return
-
-        text = await self._generate_original_news_post_text(None, items)
-        if not text.strip():
-            logger.info("qzone scheduled news publish skipped: generated content is empty or copy-like")
-            return
-
-        post = PostPayload(content=text.strip(), media=[])
-        await self._ensure_cookie_ready()
-        await self._ensure_daemon()
-        payload = await self.controller.publish_post(content=post.content, content_sanitized=True)
-        self._record_news_publish(state, items=items, post=post, payload=payload)
-        logger.info(
-            "qzone scheduled news publish succeeded fid=%s text_length=%s candidates=%s",
-            payload.get("fid") or "",
-            len(post.content),
-            len(items),
-        )
-        summary = self._news_items_summary(items, limit=1)
-        message = "新闻自动发布完成"
-        if summary:
-            message = f"{message}\n参考新闻：\n{summary}"
-        await self._notify_admin_publish_result(post, payload, message)
 
     def _scheduled_comment_target_count(self) -> int:
         configured = int(getattr(self.settings, "comment_latest_count", 1) or 1)
@@ -5355,11 +5008,6 @@ class QzoneStablePlugin(Star):
         """QQ 空间管理命令组，可绑定 Cookie、查看状态和管理说说。"""
         pass
 
-    @filter.command_group("新闻说说")
-    def news_feed(self):
-        """Google News RSS 新闻说说命令组。"""
-        pass
-
     @filter.on_astrbot_loaded()
     async def qzone_on_astrbot_loaded(self):
         """AstrBot 加载完成后启动定时任务，并预热 Qzone Cookie。"""
@@ -5629,161 +5277,7 @@ class QzoneStablePlugin(Star):
             return
         draft = await self._create_draft(event, post, anonymous=False)
         await self._notify_review_target(event, draft, "有一条 AI 写稿等待审核")
-        yield await self._markdown_result(event, f"已生成稿件 #{draft.id}，可用 过稿 {draft.id} 发布。", subdir="drafts")
-
-    async def _fetch_news_candidates_for_command(self, event: AstrMessageEvent, arg_text: str):
-        if not self._is_admin(event):
-            return self._command_result(event, "只有管理员可以获取新闻候选。")
-        default_limit = int(getattr(self.settings, "news_max_candidates", 12) or 12)
-        limit, scope_text = self._parse_news_fetch_args(arg_text, default_limit=default_limit)
-        try:
-            state = self._load_news_publish_state()
-            items = await self._news_candidates(
-                scope_override=scope_text,
-                seen_ids=self._news_published_ids(state),
-                limit=limit,
-            )
-            if not items:
-                return self._command_result(event, "没有获取到可用新闻。")
-            self._save_news_candidates_cache(items, scope_text=scope_text, requested_limit=limit)
-            return self._command_result(event, self._format_news_candidates(items))
-        except QzoneBridgeError as exc:
-            return self._command_result(event, self._error_text(exc))
-        except Exception as exc:
-            logger.warning("qzone news candidates fetch failed: %s", exc)
-            return self._command_result(event, "新闻候选获取失败。")
-
-    async def _preview_news_feed_for_command(self, event: AstrMessageEvent, arg_text: str):
-        if not self._is_admin(event):
-            return self._command_result(event, "只有管理员可以预览新闻说说。")
-        arg_text = str(arg_text or "").strip()
-        items: list[NewsItem] = []
-        cache_info: dict[str, Any] = {}
-        try:
-            if re.fullmatch(r"-?\d+", arg_text):
-                cached_items, cache_info = self._load_news_candidates_cache()
-                items = self._selected_news_items(cached_items, self._parse_news_selection(arg_text))
-                if not cached_items:
-                    return self._command_result(event, "还没有新闻候选缓存，请先执行：新闻说说 获取 10")
-                if not items:
-                    return self._command_result(event, f"新闻序号无效，当前可选范围是 1~{len(cached_items)}。")
-            else:
-                items = await self._news_candidates(scope_override=arg_text, seen_ids=set())
-                if not items:
-                    return self._command_result(event, "没有获取到可用新闻。")
-            text = await self._generate_original_news_post_text(event, items)
-        except QzoneBridgeError as exc:
-            return self._command_result(event, self._error_text(exc))
-        except Exception as exc:
-            logger.warning("qzone news preview failed: %s", exc)
-            return self._command_result(event, "新闻说说预览失败。")
-        if not text.strip():
-            return self._command_result(event, "新闻说说生成失败，可能是内容过于接近标题。")
-        summary = self._news_items_summary(items)
-        response = f"新闻说说预览：\n{text.strip()}"
-        if cache_info:
-            response = f"{response}\n\n来源：最近一次新闻候选缓存"
-        if summary:
-            response = f"{response}\n\n候选新闻：\n{summary}"
-        return self._command_result(event, response)
-
-    async def _publish_news_feed_for_command(self, event: AstrMessageEvent, arg_text: str):
-        if not self._is_admin(event):
-            return self._command_result(event, "只有管理员可以发布新闻说说。")
-        cached_items, _cache_info = self._load_news_candidates_cache()
-        if not cached_items:
-            return self._command_result(event, "还没有新闻候选缓存，请先执行：新闻说说 获取 10")
-        selection = self._parse_news_selection(arg_text)
-        items = self._selected_news_items(cached_items, selection)
-        if not items:
-            return self._command_result(event, f"新闻序号无效，当前可选范围是 1~{len(cached_items)}。")
-
-        profile_task: asyncio.Task | None = None
-        try:
-            text = await self._generate_original_news_post_text(event, items)
-            if not text.strip():
-                return self._command_result(event, "新闻说说生成失败，可能是内容过于接近标题。")
-            post = PostPayload(content=text.strip(), media=[])
-            await self._ensure_cookie_ready(event)
-            await self._ensure_daemon()
-            profile_task = self._schedule_publisher_profile(event)
-            payload = await self.controller.publish_post(content=post.content, content_sanitized=True)
-            if payload.get("fid"):
-                await self._post_store().upsert_async(
-                    QzonePost(
-                        hostuin=self._self_id(event),
-                        fid=str(payload.get("fid") or ""),
-                        appid=311,
-                        summary=post.content,
-                        images=[],
-                    )
-                )
-            state = self._load_news_publish_state()
-            self._record_news_publish(state, items=items, post=post, payload=payload)
-        except QzoneBridgeError as exc:
-            if profile_task is not None:
-                profile_task.cancel()
-            return self._command_result(event, self._error_text(exc))
-        except Exception as exc:
-            if profile_task is not None:
-                profile_task.cancel()
-            logger.warning("qzone news publish command failed: %s", exc)
-            return self._command_result(event, "新闻说说发布失败。")
-        return await self._publish_result(event, post, payload, profile_task=profile_task)
-
-    @news_feed.command("帮助")
-    async def news_feed_help(self, event: AstrMessageEvent):
-        """查看新闻说说命令组用法。"""
-        text = "\n".join(
-            [
-                "新闻说说命令",
-                "新闻说说 获取 [数量] [中国/国际/混合]：获取并缓存候选新闻，按发布时间排序。",
-                "新闻说说 预览 [序号/中国/国际/混合]：预览大模型生成的原创新闻说说，不发布。",
-                "新闻说说 发布 <序号>：选择缓存候选新闻，交给大模型生成原创说说并发布。",
-                "兼容命令：获取新闻、新闻列表、新闻说说预览、发布新闻说说。",
-            ]
-        )
-        yield self._command_result(event, text)
-
-    @news_feed.command("获取")
-    async def news_feed_fetch(self, event: AstrMessageEvent):
-        """获取并缓存 Google News RSS 候选新闻。"""
-        arg_text = self._message_after_command(self._event_text(event), ("新闻说说 获取", "新闻说说获取"))
-        yield await self._fetch_news_candidates_for_command(event, arg_text)
-
-    @news_feed.command("预览")
-    async def news_feed_preview(self, event: AstrMessageEvent):
-        """按缓存序号或范围预览新闻说说。"""
-        arg_text = self._message_after_command(self._event_text(event), ("新闻说说 预览", "新闻说说预览"))
-        yield await self._preview_news_feed_for_command(event, arg_text)
-
-    @news_feed.command("发布")
-    async def news_feed_publish(self, event: AstrMessageEvent):
-        """按缓存序号发布一条 LLM 原创新闻说说。"""
-        arg_text = self._message_after_command(self._event_text(event), ("新闻说说 发布", "新闻说说发布"))
-        yield await self._publish_news_feed_for_command(event, arg_text)
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("获取新闻", alias={"新闻列表"})
-    async def fetch_news_feed(self, event: AstrMessageEvent):
-        """获取并缓存 Google News RSS 候选新闻。"""
-        arg_text = self._message_after_command(self._event_text(event), ("获取新闻", "新闻列表"))
-        yield await self._fetch_news_candidates_for_command(event, arg_text)
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("发布新闻说说", alias={"发新闻说说"})
-    async def publish_selected_news_feed(self, event: AstrMessageEvent):
-        """按缓存序号发布一条 LLM 原创新闻说说。"""
-        arg_text = self._message_after_command(self._event_text(event), ("发布新闻说说", "发新闻说说"))
-        yield await self._publish_news_feed_for_command(event, arg_text)
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("新闻说说预览")
-    async def preview_news_feed(self, event: AstrMessageEvent):
-        """Preview an original Qzone post generated from Google News RSS candidates."""
-
-        arg_text = self._message_after_command(self._event_text(event), ("新闻说说预览",))
-        yield await self._preview_news_feed_for_command(event, arg_text)
+        yield await self._markdown_result(event, f"已生成稿件 #{draft.id}。", subdir="drafts")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("删说说")
@@ -5888,193 +5382,6 @@ class QzoneStablePlugin(Star):
             return
         yield await self._markdown_result(event, format_action_result("回复结果", payload), subdir="posts")
 
-    @filter.command("投稿")
-    async def contribute_post(self, event: AstrMessageEvent, content: str = ""):
-        """提交一条待审核的说说投稿。"""
-        post = await self._collect_target_post_payload(event, content, ("投稿",))
-        if not post.content.strip() and not post.media:
-            yield self._command_result(event, "投稿内容或图片不能为空。")
-            return
-        draft = await self._create_draft(event, post, anonymous=False)
-        await self._notify_review_target(event, draft, "收到一条投稿")
-        yield await self._markdown_result(event, f"投稿已收到，稿件编号 #{draft.id}。", subdir="drafts")
-
-    @filter.command("匿名投稿")
-    async def anon_contribute_post(self, event: AstrMessageEvent, content: str = ""):
-        """匿名提交一条待审核的说说投稿。"""
-        post = await self._collect_target_post_payload(event, content, ("匿名投稿",))
-        if not post.content.strip() and not post.media:
-            yield self._command_result(event, "投稿内容或图片不能为空。")
-            return
-        draft = await self._create_draft(event, post, anonymous=True)
-        await self._notify_review_target(event, draft, "收到一条匿名投稿")
-        yield await self._markdown_result(event, f"匿名投稿已收到，稿件编号 #{draft.id}。", subdir="drafts")
-
-    @filter.command("撤稿")
-    async def recall_post(self, event: AstrMessageEvent):
-        """撤回自己尚未审核的投稿。"""
-        draft_id, _ = self._draft_id_from_event(event, ("撤稿",))
-        if draft_id <= 0:
-            yield self._command_result(event, "请提供要撤回的稿件ID，例如：撤稿 3。")
-            return
-        sender_id = self._sender_id(event)
-        is_admin = self._is_admin(event)
-        draft = await self.drafts.get_async(draft_id)
-        if draft is None:
-            yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
-            return
-        if draft.author_uin != sender_id and not is_admin:
-            yield self._command_result(event, "只能撤回自己的投稿。")
-            return
-        if draft.status != "pending":
-            yield self._command_result(event, f"稿件 #{draft.id} 当前是 {draft.status}，不能撤回。")
-            return
-        failure = ""
-
-        def recall(current: DraftPost) -> None:
-            nonlocal failure
-            if current.author_uin != sender_id and not is_admin:
-                failure = "permission"
-                return
-            if current.status != "pending":
-                failure = current.status
-                return
-            current.status = "recalled"
-
-        updated = await self.drafts.update_async(draft.id, recall)
-        if updated is None:
-            yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
-            return
-        if failure == "permission":
-            yield self._command_result(event, "只能撤回自己的投稿。")
-            return
-        if failure:
-            yield self._command_result(event, f"稿件 #{updated.id} 当前是 {failure}，不能撤回。")
-            return
-        yield await self._markdown_result(event, f"稿件 #{updated.id} 已撤回。", subdir="drafts")
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("看稿", alias={"查看稿件"})
-    async def view_post(self, event: AstrMessageEvent):
-        """查看待审核投稿列表或指定稿件。"""
-        draft_id, _ = self._draft_id_from_event(event, ("看稿", "查看稿件"))
-        if draft_id > 0:
-            draft = await self.drafts.get_async(draft_id)
-            text = draft.preview(include_private=True) if draft else f"稿件 #{draft_id} 不存在。"
-        else:
-            drafts = (await self.drafts.list_async(status="pending"))[-10:]
-            text = "\n\n".join(draft.preview(include_private=True) for draft in drafts) or "暂无待审核稿件。"
-        yield await self._markdown_result(event, text, subdir="drafts")
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("过稿", alias={"通过稿件", "通过投稿"})
-    async def approve_post(self, event: AstrMessageEvent):
-        """通过投稿并发布到当前 QQ 空间。"""
-        draft_id, _ = self._draft_id_from_event(event, ("过稿", "通过稿件", "通过投稿"))
-        if draft_id <= 0:
-            yield self._command_result(event, "请提供要通过的稿件ID，例如：过稿 3。")
-            return
-        draft = await self.drafts.get_async(draft_id)
-        if draft is None:
-            yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
-            return
-        if draft.status != "pending":
-            yield self._command_result(event, f"稿件 #{draft.id} 当前是 {draft.status}，不能过稿。")
-            return
-        failure = ""
-
-        def claim_approved(current: DraftPost) -> None:
-            nonlocal failure
-            if current.status != "pending":
-                failure = current.status
-                return
-            current.status = "approved"
-
-        claimed = await self.drafts.update_async(draft.id, claim_approved)
-        if claimed is None:
-            yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
-            return
-        if failure:
-            yield self._command_result(event, f"稿件 #{claimed.id} 当前是 {failure}，不能过稿。")
-            return
-        draft = claimed
-        post = PostPayload(content=self._draft_publish_content(draft), media=normalize_media_list(draft.media))
-        profile_task: asyncio.Task | None = None
-        try:
-            await self._ensure_cookie_ready(event)
-            profile_task = self._schedule_publisher_profile(event)
-            post, payload = await self._publish_post_payload(post, event=event)
-            published_fid = str(payload.get("fid") or "")
-
-            def mark_published(current: DraftPost) -> None:
-                current.status = "published"
-                current.published_fid = published_fid
-
-            updated_draft = await self.drafts.update_async(draft.id, mark_published) or draft
-            if published_fid:
-                login_uin = 0
-                try:
-                    login_uin = int((await self.controller.get_status(probe_daemon=False)).get("login_uin") or 0)
-                except Exception:
-                    login_uin = self._self_id(event)
-                saved_post = QzonePost(
-                    hostuin=login_uin,
-                    fid=published_fid,
-                    appid=311,
-                    summary=post.content,
-                    nickname="",
-                    images=[str(item.source) for item in post.media],
-                )
-                await self._post_store().upsert_async(saved_post)
-            await self._notify_draft_author(event, updated_draft, f"你的投稿 #{updated_draft.id} 已通过并发布。")
-        except QzoneBridgeError as exc:
-            if profile_task is not None:
-                profile_task.cancel()
-
-            def rollback_approved(current: DraftPost) -> None:
-                if current.status == "approved":
-                    current.status = "pending"
-
-            await self.drafts.update_async(draft.id, rollback_approved)
-            yield self._command_result(event, self._error_text(exc))
-            return
-        yield await self._publish_result(event, post, payload, profile_task=profile_task)
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("拒稿", alias={"拒绝稿件", "拒绝投稿"})
-    async def reject_post(self, event: AstrMessageEvent):
-        """拒绝投稿并记录原因。"""
-        draft_id, reason = self._draft_id_from_event(event, ("拒稿", "拒绝稿件", "拒绝投稿"))
-        if draft_id <= 0:
-            yield self._command_result(event, "请提供要拒绝的稿件ID，例如：拒稿 3 原因。")
-            return
-        draft = await self.drafts.get_async(draft_id)
-        if draft is None:
-            yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
-            return
-        if draft.status != "pending":
-            yield self._command_result(event, f"稿件 #{draft.id} 当前是 {draft.status}，不能拒稿。")
-            return
-        failure = ""
-
-        def reject(current: DraftPost) -> None:
-            nonlocal failure
-            if current.status != "pending":
-                failure = current.status
-                return
-            current.status = "rejected"
-            current.reject_reason = reason or "未填写原因"
-
-        updated = await self.drafts.update_async(draft.id, reject)
-        if updated is None:
-            yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
-            return
-        if failure:
-            yield self._command_result(event, f"稿件 #{updated.id} 当前是 {failure}，不能拒稿。")
-            return
-        await self._notify_draft_author(event, updated, f"你的投稿 #{updated.id} 未通过：{updated.reject_reason}")
-        yield await self._markdown_result(event, f"稿件 #{updated.id} 已拒绝。", subdir="drafts")
-
     @qzone.command("help")
     async def qzone_help(self, event: AstrMessageEvent):
         """查看 QQ 空间 Ultra 的命令用法。"""
@@ -6089,17 +5396,8 @@ class QzoneStablePlugin(Star):
                 "赞说说 [@用户] [序号/范围]",
                 "发说说 <内容> [图片]",
                 "写说说/写稿 <主题> [图片]",
-                "新闻说说 获取 [数量] [中国/国际/混合]",
-                "新闻说说 预览 [序号/中国/国际/混合]",
-                "新闻说说 发布 <序号>",
                 "删说说 <序号>",
                 "回评/回复评论 <稿件ID> [评论序号]",
-                "投稿 <内容> [图片]",
-                "匿名投稿 <内容> [图片]",
-                "撤稿 <稿件ID>",
-                "看稿/查看稿件 [稿件ID]",
-                "过稿/通过稿件/通过投稿 <稿件ID>",
-                "拒稿/拒绝稿件/拒绝投稿 <稿件ID> [原因]",
                 "",
                 "保留的管理命令:",
                 "/qzone status",
