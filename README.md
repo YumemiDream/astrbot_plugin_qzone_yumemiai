@@ -11,9 +11,6 @@ QzoneUltra 现在可以把 **Life Scheduler 日程插件** 和 **OmniDraw 自拍
 
 这条链路适合做每日生活号、陪伴型人设、自动运营空间：它不只是定时发一段文字，而是把「今天要做什么」变成「看起来真的去过、拍过、分享过」的图文日常。
 
-<p align="center">
-  <img src="docs/assets/life-selfie-qzone-demo.png" alt="Life Scheduler + OmniDraw 自动日常说说效果展示" width="520">
-</p>
 
 - 定时任务：复用 `trigger.publish_cron`，开启 `life_publish.enabled=true` 后优先走日常自拍链路。
 - 日程联动：建议搭配 [木有知大佬的 Life Scheduler](https://github.com/muyouzhi6/astrbot_plugin_life_scheduler) 使用，调用 `astrbot_plugin_life_scheduler.get_life_context()` 读取今日安排，让内容贴合当天场景。
